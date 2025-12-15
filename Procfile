@@ -1,2 +1,2 @@
-web: gunicorn web_state:app
-worker: python tumbler.py
+
+worker: python main.py
