@@ -3,6 +3,7 @@
 planner.py - Fixed Maturity Trend System
 Target: FF_XBTUSD_260327
 Safe Mode: Accepts `capital_pct` to limit exposure.
+FIXED: Stop Loss logic now correctly subtracts loss allowance for Longs and adds for Shorts.
 """
 
 import json
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import kraken_ohlc
+import kraken_futures as kf
 
 # Configuration
 dry = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
@@ -195,29 +197,37 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, allocated_co
             api.send_order({"orderType": "stp", "symbol": symbol, "side": side, "size": qty, "stopPrice": stop_px_int, "reduceOnly": True})
         except Exception as e: log.error(f"Failed to place {label} stop: {e}")
 
+    # FIXING THE MATH HERE
+    # loss_allowance is NEGATIVE.
+    # For LONG: We want Stop < Current. So Price + (Negative).
+    # For SHORT: We want Stop > Current. So Price - (Negative) = Price + Positive.
+    
+    direction = 1 if is_long else -1
+    
     # S1 Stop
     if not state["s1"]["stopped"] and abs(s1_lev) > 0.01:
         peak_s1 = state["s1"]["peak_equity"]
         if peak_s1 == 0: peak_s1 = allocated_collateral
+        
         loss_allowance = peak_s1 * (1 - S1_STOP_PCT) - allocated_collateral
-        # Stop price calculation: Price where equity loss equals allowance
-        # Delta P * Size = Loss
-        # Delta P = Loss / Size
-        stop_price_s1 = current_price + (loss_allowance/abs(net_size) * (-1 if is_long else 1))
+        # Formula: Price + (Loss / Size) * Direction
+        # Long: Price + (Neg) * 1 = Lower.
+        # Short: Price + (Neg) * -1 = Higher.
+        stop_price_s1 = current_price + (loss_allowance / abs(net_size)) * direction
+        
         place_stop("S1", (allocated_collateral * abs(s1_lev)) / current_price, stop_price_s1)
 
     # S2 Stop
     if not state["s2"]["stopped"] and abs(s2_lev) > 0.01:
         peak_s2 = state["s2"]["peak_equity"]
         if peak_s2 == 0: peak_s2 = allocated_collateral
+        
         loss_allowance = peak_s2 * (1 - S2_STOP_PCT) - allocated_collateral
-        stop_price_s2 = current_price + (loss_allowance/abs(net_size) * (-1 if is_long else 1))
+        stop_price_s2 = current_price + (loss_allowance / abs(net_size)) * direction
+        
         place_stop("S2", (allocated_collateral * abs(s2_lev)) / current_price, stop_price_s2)
 
 def daily_trade(api, capital_pct=1.0):
-    """
-    capital_pct: Float (0.0 to 1.0). Percentage of Portfolio Value this strategy is allowed to use.
-    """
     log.info("--- Starting Planner Cycle ---")
     
     # Data Fetch
@@ -233,7 +243,6 @@ def daily_trade(api, capital_pct=1.0):
     try:
         accts = api.get_accounts()
         total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
-        # PARTITION CAPITAL
         collateral = total_pv * capital_pct
         log.info(f"Total PV: ${total_pv:.2f} | Allocated Collateral ({capital_pct*100}%): ${collateral:.2f}")
     except Exception as e:
@@ -247,7 +256,7 @@ def daily_trade(api, capital_pct=1.0):
     futs_price = get_market_price(api, SYMBOL_FUTS_UC)
     if futs_price == 0: futs_price = current_spot
     
-    # Sizing (Based on Allocated Collateral)
+    # Sizing
     target_qty = (collateral * target_leverage) / futs_price
     current_qty = get_current_net_position(api, SYMBOL_FUTS_UC)
     delta_qty = target_qty - current_qty
@@ -259,7 +268,6 @@ def daily_trade(api, capital_pct=1.0):
     
     if res == "CHECK_AGAIN" and not dry:
         time.sleep(2)
-        # Re-calc remaining delta
         rem_delta = round(target_qty - get_current_net_position(api, SYMBOL_FUTS_UC), 4)
         if abs(rem_delta) >= MIN_TRADE_SIZE:
             log.info(f"Limit not filled. Sending FALLBACK MARKET order: {rem_delta:.4f}")
