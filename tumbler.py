@@ -2,22 +2,20 @@
 """
 tumbler.py - Perpetual Future Strategy
 Target: PF_XBTUSD
-Safe Mode: Accepts `capital_pct` to limit exposure.
-UPDATES:
-- Logs full API responses for debugging.
-- cancel_all is strictly scoped to PF_XBTUSD.
+Updates:
+- Returns Status String for Main Report.
+- Logs cleaner Order IDs.
 """
 
 import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import kraken_ohlc
-import kraken_futures as kf
 
 dry = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 
@@ -26,7 +24,6 @@ SYMBOL_FUTS_LC = "pf_xbtusd"
 SYMBOL_OHLC_KRAKEN = "XBTUSD"
 INTERVAL_KRAKEN = 1440
 
-# --- Strategy Parameters ---
 SMA_PERIOD_1 = 32   
 SMA_PERIOD_2 = 114  
 STATIC_STOP_PCT = 0.043  
@@ -37,18 +34,16 @@ STOP_WAIT_TIME = 600
 III_WINDOW = 27  
 III_T_LOW = 0.058  
 III_T_HIGH = 0.259  
-LEV_LOW = 0.04
-LEV_MID = 2.15
-LEV_HIGH = 1.935
+LEV_LOW = 0.079   
+LEV_MID = 4.327   
+LEV_HIGH = 3.868  
 
 FLAT_REGIME_THRESHOLD = 0.356  
 BAND_WIDTH_PCT = 0.077  
 
 STATE_FILE = Path("sma_state.json")
-
 log = logging.getLogger("tumbler")
 
-# --- Helpers ---
 def calculate_iii(df):
     if len(df) < III_WINDOW + 1: return 0.0
     df_calc = df.copy()
@@ -86,7 +81,7 @@ def check_flat_regime_release(df, current_flat_regime):
     thresh_sma2 = curr['sma_2'] * BAND_WIDTH_PCT
     
     if diff_sma1 <= thresh_sma1 or diff_sma2 <= thresh_sma2:
-        log.info(f"RELEASING FLAT REGIME: Price ${curr['close']:.2f} entered band")
+        log.info(f"RELEASED FLAT REGIME: Price ${curr['close']:.2f}")
         return False
     return True
 
@@ -94,55 +89,38 @@ def mark_price(api):
     tk = api.get_tickers()
     for t in tk["tickers"]:
         if t["symbol"] == SYMBOL_FUTS_UC: return float(t["markPrice"])
-    raise RuntimeError("Mark-price for PF_XBTUSD not found")
+    raise RuntimeError("Mark-price not found")
 
 def cancel_all_pf(api):
-    """Safely cancel orders ONLY for PF_XBTUSD."""
-    log.info(f"Cancelling all orders for {SYMBOL_FUTS_UC}...")
-    try:
-        api.cancel_all_orders({"symbol": SYMBOL_FUTS_UC})
-    except Exception as e:
-        log.warning(f"cancel_all_orders failed: {e}")
+    try: api.cancel_all_orders({"symbol": SYMBOL_FUTS_UC})
+    except Exception: pass
 
 def get_current_position(api):
     try:
         pos = api.get_open_positions()
         for p in pos.get("openPositions", []):
             if p["symbol"] == SYMBOL_FUTS_UC:
-                return {
-                    "signal": "LONG" if p["side"] == "long" else "SHORT",
-                    "side": p["side"],
-                    "size_btc": abs(float(p["size"])),
-                }
+                return {"signal": "LONG" if p["side"] == "long" else "SHORT", "side": p["side"], "size_btc": abs(float(p["size"]))}
         return None
-    except Exception as e:
-        log.warning(f"Failed to get position: {e}"); return None
+    except Exception: return None
 
-# --- Execution ---
 def flatten_position_limit(api, current_price):
     pos = get_current_position(api)
     if not pos: return
-    
     side = "sell" if pos["side"] == "long" else "buy"
-    size = pos["size_btc"]
-    
     limit_price = int(round(current_price * (1 + LIMIT_OFFSET_PCT) if side == "sell" else current_price * (1 - LIMIT_OFFSET_PCT)))
-    log.info(f"Flattening LIMIT: {side} {size} @ {limit_price}")
     if not dry:
         try:
-            resp = api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS_LC, "side": side, "size": size, "limitPrice": limit_price})
-            log.info(f"Flatten Limit Resp: {resp}")
+            api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS_LC, "side": side, "size": pos["size_btc"], "limitPrice": limit_price})
         except Exception as e: log.error(f"Flatten limit failed: {e}")
 
 def flatten_position_market(api):
     pos = get_current_position(api)
     if not pos: return
     side = "sell" if pos["side"] == "long" else "buy"
-    log.info(f"Flattening MARKET: {side} {pos['size_btc']}")
     if not dry:
         try:
-            resp = api.send_order({"orderType": "mkt", "symbol": SYMBOL_FUTS_LC, "side": side, "size": pos['size_btc']})
-            log.info(f"Flatten MKT Resp: {resp}")
+            api.send_order({"orderType": "mkt", "symbol": SYMBOL_FUTS_LC, "side": side, "size": pos["size_btc"]})
         except Exception as e: log.error(f"Flatten market failed: {e}")
     cancel_all_pf(api)
 
@@ -150,57 +128,44 @@ def open_position(api, signal, leverage, collateral, current_price):
     notional = collateral * leverage
     size_btc = round(notional / current_price, 4)
     side = "buy" if signal == "LONG" else "sell"
-    
-    log.info(f"Opening {signal} | Lev: {leverage}x | Size: {size_btc:.4f}")
     if dry: return size_btc, current_price
     
-    # 1. Limit Entry
+    # Limit
     limit_price = int(round(current_price * (1 - LIMIT_OFFSET_PCT) if side == "buy" else current_price * (1 + LIMIT_OFFSET_PCT)))
     try:
-        resp = api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS_LC, "side": side, "size": size_btc, "limitPrice": limit_price})
-        log.info(f"Entry Limit Resp: {resp}")
+        api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS_LC, "side": side, "size": size_btc, "limitPrice": limit_price})
         time.sleep(STOP_WAIT_TIME)
     except Exception as e: log.error(f"Entry limit failed: {e}")
     
-    # 2. Market Cleanup
-    cancel_all_pf(api) 
-    
+    # Cleanup & Market
+    cancel_all_pf(api)
     pos = get_current_position(api)
-    filled_size = pos["size_btc"] if pos else 0.0
+    filled = pos["size_btc"] if pos else 0.0
+    remaining = size_btc - filled
     
-    # Fill remainder
-    remaining = size_btc - filled_size
     if remaining > 0.0001:
-        log.info(f"Filling remaining {remaining:.4f} via MARKET")
+        log.info(f"Filling remaining {remaining:.4f} via MKT")
         try:
-            resp = api.send_order({"orderType": "mkt", "symbol": SYMBOL_FUTS_LC, "side": side, "size": remaining})
-            log.info(f"Entry MKT Resp: {resp}")
+            api.send_order({"orderType": "mkt", "symbol": SYMBOL_FUTS_LC, "side": side, "size": remaining})
         except Exception as e: log.error(f"Entry market failed: {e}")
-        
-    # 3. Stops & TP
+    
+    # Stops/TP
     pos_final = get_current_position(api)
     if pos_final:
         final_size = pos_final["size_btc"]
-        fill_price = current_price # Approx
-        
-        # Stop Loss
-        sl_dist = fill_price * STATIC_STOP_PCT
-        # FIX: Ensure int price
-        sl_price = int(round(fill_price - sl_dist if side == "buy" else fill_price + sl_dist))
+        sl_price = int(round(current_price * (1 - STATIC_STOP_PCT) if side == "buy" else current_price * (1 + STATIC_STOP_PCT)))
         sl_side = "sell" if side == "buy" else "buy"
         try:
-            resp = api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS_LC, "side": sl_side, "size": final_size, "stopPrice": sl_price, "reduceOnly": True})
-            log.info(f"Placed Stop @ {sl_price} | Resp: {resp}")
+            api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS_LC, "side": sl_side, "size": final_size, "stopPrice": sl_price, "reduceOnly": True})
+            log.info(f"Stop Placed @ {sl_price}")
         except Exception as e: log.error(f"SL failed: {e}")
         
-        # TP
-        tp_price = int(round(fill_price * (1 + TAKE_PROFIT_PCT) if side == "buy" else fill_price * (1 - TAKE_PROFIT_PCT)))
+        tp_price = int(round(current_price * (1 + TAKE_PROFIT_PCT) if side == "buy" else current_price * (1 - TAKE_PROFIT_PCT)))
         try:
-            resp = api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS_LC, "side": sl_side, "size": final_size, "limitPrice": tp_price, "reduceOnly": True})
-            log.info(f"Placed TP @ {tp_price} | Resp: {resp}")
+            api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS_LC, "side": sl_side, "size": final_size, "limitPrice": tp_price, "reduceOnly": True})
+            log.info(f"TP Placed @ {tp_price}")
         except Exception as e: log.error(f"TP failed: {e}")
-        
-        return final_size, fill_price
+        return final_size, current_price
     return 0, 0
 
 def load_state():
@@ -210,73 +175,69 @@ def save_state(st):
     STATE_FILE.write_text(json.dumps(st, indent=2))
 
 def init_tumbler(api):
-    log.info("Initializing Tumbler...")
     if not STATE_FILE.exists():
         df = kraken_ohlc.get_ohlc(SYMBOL_OHLC_KRAKEN, INTERVAL_KRAKEN)
         iii = calculate_iii(df)
-        is_flat = iii < FLAT_REGIME_THRESHOLD
-        save_state({"flat_regime_active": is_flat, "trades": [], "starting_capital": None})
+        save_state({"flat_regime_active": iii < FLAT_REGIME_THRESHOLD, "trades": [], "starting_capital": None})
 
-def daily_trade(api, capital_pct=1.0):
-    log.info("--- Starting Tumbler Cycle ---")
-    state = load_state()
-    
-    df = kraken_ohlc.get_ohlc(SYMBOL_OHLC_KRAKEN, INTERVAL_KRAKEN)
-    curr_price = mark_price(api)
-    
+def daily_trade(api, capital_pct=1.0) -> str:
+    log.info("--- Starting Tumbler ---")
     try:
+        state = load_state()
+        df = kraken_ohlc.get_ohlc(SYMBOL_OHLC_KRAKEN, INTERVAL_KRAKEN)
+        curr_price = mark_price(api)
+        
         accts = api.get_accounts()
         total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
         collateral = total_pv * capital_pct
-        log.info(f"Total PV: ${total_pv:.2f} | Tumbler Allocated: ${collateral:.2f}")
-    except Exception as e:
-        log.error(f"Account check failed: {e}"); return
+        log.info(f"Allocated Capital: ${collateral:.2f}")
 
-    if state["starting_capital"] is None: state["starting_capital"] = collateral
-    
-    iii = calculate_iii(df)
-    leverage = determine_leverage(iii)
-    
-    current_flat = state.get("flat_regime_active", False)
-    is_flat = check_flat_regime_trigger(iii, current_flat)
-    if is_flat: is_flat = check_flat_regime_release(df, is_flat)
-    state["flat_regime_active"] = is_flat
-    
-    df_calc = calculate_smas(df)
-    sma1 = df_calc['sma_1'].iloc[-1]
-    sma2 = df_calc['sma_2'].iloc[-1]
-    
-    signal = "FLAT"
-    if not is_flat:
-        if curr_price > sma1 and curr_price > sma2: signal = "LONG"
-        elif curr_price < sma1 and curr_price < sma2: signal = "SHORT"
-    
-    log.info(f"Signal: {signal} | FlatRegime: {is_flat} | Lev: {leverage}x")
-    
-    # 1. Clear OLD orders only
-    cancel_all_pf(api)
-    
-    # 2. Close if signal changed or flat
-    pos = get_current_position(api)
-    needs_flatten = False
-    if pos:
-        if signal == "FLAT": needs_flatten = True
-        elif signal == "LONG" and pos["side"] == "short": needs_flatten = True
-        elif signal == "SHORT" and pos["side"] == "long": needs_flatten = True
+        if state["starting_capital"] is None: state["starting_capital"] = collateral
         
-    if needs_flatten:
-        flatten_position_limit(api, curr_price)
-        if not dry: time.sleep(STOP_WAIT_TIME)
-        flatten_position_market(api)
-    
-    # 3. Open New
-    if signal != "FLAT":
-        # Check if we already have correct position
+        iii = calculate_iii(df)
+        leverage = determine_leverage(iii)
+        
+        current_flat = state.get("flat_regime_active", False)
+        is_flat = check_flat_regime_trigger(iii, current_flat)
+        if is_flat: is_flat = check_flat_regime_release(df, is_flat)
+        state["flat_regime_active"] = is_flat
+        
+        df_calc = calculate_smas(df)
+        sma1, sma2 = df_calc['sma_1'].iloc[-1], df_calc['sma_2'].iloc[-1]
+        
+        signal = "FLAT"
+        if not is_flat:
+            if curr_price > sma1 and curr_price > sma2: signal = "LONG"
+            elif curr_price < sma1 and curr_price < sma2: signal = "SHORT"
+        
+        log.info(f"Signal: {signal} | Flat: {is_flat} | Lev: {leverage}x")
+        
+        cancel_all_pf(api)
         pos = get_current_position(api)
-        if not pos:
-            size, price = open_position(api, signal, leverage, collateral, curr_price)
-            if size > 0:
-                state["trades"].append({"date": datetime.now().isoformat(), "signal": signal, "size": size, "price": price, "leverage": leverage})
+        needs_flatten = False
+        if pos:
+            if signal == "FLAT": needs_flatten = True
+            elif signal == "LONG" and pos["side"] == "short": needs_flatten = True
+            elif signal == "SHORT" and pos["side"] == "long": needs_flatten = True
+            
+        if needs_flatten:
+            flatten_position_limit(api, curr_price)
+            if not dry: time.sleep(STOP_WAIT_TIME)
+            flatten_position_market(api)
+        
+        status = "SKIPPED (FLAT or NO CHANGE)"
+        if signal != "FLAT":
+            pos = get_current_position(api)
+            if not pos:
+                size, price = open_position(api, signal, leverage, collateral, curr_price)
+                if size > 0:
+                    state["trades"].append({"date": datetime.now().isoformat(), "signal": signal, "size": size, "price": price})
+                    status = f"EXECUTED {signal} ({size})"
+            else:
+                status = f"ALREADY POSITIONED ({pos['size_btc']})"
 
-    save_state(state)
-    log.info("Tumbler Cycle Complete.")
+        save_state(state)
+        return status
+    except Exception as e:
+        log.exception(f"Tumbler execution error: {e}")
+        return f"ERROR: {e}"
