@@ -3,7 +3,10 @@
 planner.py - Fixed Maturity Trend System
 Target: FF_XBTUSD_260327
 Safe Mode: Accepts `capital_pct` to limit exposure.
-FIXED: Stop Loss logic now correctly subtracts loss allowance for Longs and adds for Shorts.
+UPDATES: 
+- Adds 10s delay after market orders to allow position propagation.
+- Logs full API responses for debugging.
+- Warns if stops are skipped due to size=0.
 """
 
 import json
@@ -164,7 +167,9 @@ def execute_delta_order(api, symbol: str, delta_size: float, current_price: floa
     if dry: return "FILLED"
 
     try:
-        api.send_order({"orderType": "lmt", "symbol": symbol, "side": side, "size": abs_size, "limitPrice": limit_price})
+        resp = api.send_order({"orderType": "lmt", "symbol": symbol, "side": side, "size": abs_size, "limitPrice": limit_price})
+        log.info(f"Limit Order Resp: {resp}")
+        
         log.info(f"Waiting {STOP_WAIT_TIME}s for fill...")
         time.sleep(STOP_WAIT_TIME)
         
@@ -179,7 +184,11 @@ def execute_delta_order(api, symbol: str, delta_size: float, current_price: floa
 
 def manage_stop_loss_orders(api, symbol: str, current_price: float, allocated_collateral: float, net_size: float, s1_lev: float, s2_lev: float, state: Dict):
     log.info(f"--- Setting Stops for {symbol} ---")
-    if dry or abs(net_size) < MIN_TRADE_SIZE: return
+    if dry: return
+    
+    if abs(net_size) < MIN_TRADE_SIZE:
+        log.warning(f"SKIPPING STOPS: Net Size {net_size} is less than min trade size. (API lag?)")
+        return
 
     # CRITICAL: Only cancel orders for THIS symbol
     try: api.cancel_all_orders({"symbol": symbol})
@@ -194,14 +203,13 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, allocated_co
         stop_px_int = int(round(stop_px))
         log.info(f"[{label}] Placing STOP {side.upper()} {qty:.4f} @ {stop_px_int}")
         try:
-            api.send_order({"orderType": "stp", "symbol": symbol, "side": side, "size": qty, "stopPrice": stop_px_int, "reduceOnly": True})
+            resp = api.send_order({"orderType": "stp", "symbol": symbol, "side": side, "size": qty, "stopPrice": stop_px_int, "reduceOnly": True})
+            log.info(f"[{label}] Stop Resp: {resp}")
         except Exception as e: log.error(f"Failed to place {label} stop: {e}")
 
-    # FIXING THE MATH HERE
     # loss_allowance is NEGATIVE.
     # For LONG: We want Stop < Current. So Price + (Negative).
     # For SHORT: We want Stop > Current. So Price - (Negative) = Price + Positive.
-    
     direction = 1 if is_long else -1
     
     # S1 Stop
@@ -210,9 +218,6 @@ def manage_stop_loss_orders(api, symbol: str, current_price: float, allocated_co
         if peak_s1 == 0: peak_s1 = allocated_collateral
         
         loss_allowance = peak_s1 * (1 - S1_STOP_PCT) - allocated_collateral
-        # Formula: Price + (Loss / Size) * Direction
-        # Long: Price + (Neg) * 1 = Lower.
-        # Short: Price + (Neg) * -1 = Higher.
         stop_price_s1 = current_price + (loss_allowance / abs(net_size)) * direction
         
         place_stop("S1", (allocated_collateral * abs(s1_lev)) / current_price, stop_price_s1)
@@ -272,16 +277,24 @@ def daily_trade(api, capital_pct=1.0):
         if abs(rem_delta) >= MIN_TRADE_SIZE:
             log.info(f"Limit not filled. Sending FALLBACK MARKET order: {rem_delta:.4f}")
             try: 
-                api.send_order({
+                resp = api.send_order({
                     "orderType": "mkt", 
                     "symbol": SYMBOL_FUTS_UC, 
                     "side": "buy" if rem_delta > 0 else "sell", 
                     "size": abs(rem_delta)
                 })
+                log.info(f"Fallback MKT Resp: {resp}")
+                
+                # IMPORTANT: Wait for position propagation
+                log.info("Waiting 10s for position update...")
+                time.sleep(10)
+                
             except Exception as e: log.error(f"Fallback failed: {e}")
     
-    # Stops
+    # Stops - Refresh Position first!
     final_net_size = get_current_net_position(api, SYMBOL_FUTS_UC)
+    log.info(f"Final Net Size for Stops: {final_net_size}")
+    
     manage_stop_loss_orders(api, SYMBOL_FUTS_UC, futs_price, collateral, final_net_size, s1_lev, s2_lev, state)
 
     # Save
