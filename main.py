@@ -3,7 +3,7 @@
 master_trader.py - Unified Orchestrator for Planner, Tumbler, and Gainer
 Target: FF_XBTUSD_260130 (Fixed Jan 2030)
 Features:
-- Global Leverage Cap (MAX 1x).
+- Global Leverage Multiplier (4x on final position).
 - Net Leverage Aggregation.
 - Execution: Limit Chaser (Post-Only).
 - Independent Virtual Stop Losses.
@@ -32,8 +32,8 @@ SYMBOL_OHLC = "XBTUSD"
 CAP_SPLIT = 0.333  
 
 # GLOBAL LEVERAGE CONTROL
-# This acts as a hard ceiling. If the aggregated logic requests 2.5x, it is capped here.
-GLOBAL_MAX_LEVERAGE = 1.0 
+# Updated: This is a MULTIPLIER. If strategies sum to 1.0x, we execute 4.0x.
+GLOBAL_LEVERAGE_MULTIPLIER = 4.0
 
 # Execution Settings
 LIMIT_CHASE_DURATION = 720  # 12 minutes
@@ -64,8 +64,9 @@ PLANNER_PARAMS = {
 TUMBLER_PARAMS = {
     "SMA1": 32, "SMA2": 114, "STOP": 0.043, "TP": 0.126,
     "III_WIN": 27, "FLAT_THRESH": 0.356, "BAND": 0.077,
-    # These raw leverage values will be scaled down by GLOBAL_MAX_LEVERAGE logic later
-    "LEVS": [0.079, 4.327, 3.868], "III_TH": [0.058, 0.259]
+    # Updated Levs: 0.079/4.327, 4.327/4.327, 3.868/4.327
+    "LEVS": [0.079/4.327, 4.327/4.327, 3.868/4.327], 
+    "III_TH": [0.058, 0.259]
 }
 
 # Gainer
@@ -129,7 +130,7 @@ def get_net_position(api):
 # --- Strategy Modules ---
 
 def run_planner(df_1d, state, capital):
-    """Returns Raw Target Leverage (-2.0 to 2.0)"""
+    """Returns Raw Target Leverage (Divided by 2)"""
     s = state["planner"]
     if s["peak_equity"] < capital: s["peak_equity"] = capital 
     
@@ -164,10 +165,8 @@ def run_planner(df_1d, state, capital):
     # Raw leverage from strategy logic
     raw_net = s1_lev + s2_lev
     
-    # Cap individual strategy at Global Max? 
-    # Or let aggregation handle it? 
-    # Usually better to clamp here first to keep 'virtual' size sane.
-    return max(-GLOBAL_MAX_LEVERAGE, min(GLOBAL_MAX_LEVERAGE, raw_net))
+    # MODIFIED: Divide planner contribution by 2.
+    return raw_net / 2.0
 
 def run_tumbler(df_1d, state, capital):
     """Returns Target Leverage"""
@@ -178,16 +177,18 @@ def run_tumbler(df_1d, state, capital):
     log_ret = np.log(df_1d['close'] / df_1d['close'].shift(1))
     iii = (log_ret.rolling(w).sum().abs() / log_ret.abs().rolling(w).sum()).fillna(0).iloc[-1]
     
-    # Original logic produced 4x. We must scale this.
-    # If III indicates 'High Conviction', we go to GLOBAL_MAX.
-    # If 'Low', we go to fraction.
-    
-    scale_factor = GLOBAL_MAX_LEVERAGE # 1.0
-    
-    lev = scale_factor # Default High
-    if iii < TUMBLER_PARAMS["III_TH"][0]: lev = scale_factor * 0.2 # Low (0.2x)
-    elif iii < TUMBLER_PARAMS["III_TH"][1]: lev = scale_factor # Mid (1.0x)
-    
+    # MODIFIED: Logic to use explicit tiers based on III
+    lev = 0.0
+    # Tier 1: Low Vol/Conviction
+    if iii < TUMBLER_PARAMS["III_TH"][0]: 
+        lev = TUMBLER_PARAMS["LEVS"][0] # 0.079 / 4.327
+    # Tier 2: Mid
+    elif iii < TUMBLER_PARAMS["III_TH"][1]: 
+        lev = TUMBLER_PARAMS["LEVS"][1] # 4.327 / 4.327 (1.0)
+    # Tier 3: High
+    else:
+        lev = TUMBLER_PARAMS["LEVS"][2] # 3.868 / 4.327
+
     # Flat Regime
     if iii < TUMBLER_PARAMS["FLAT_THRESH"]:
         if not s["flat_regime"]: log.info(f"Tumbler: Entering Flat Regime (III={iii:.4f})")
@@ -242,7 +243,8 @@ def run_gainer(df_1h, df_1d):
     
     total = sum(w)
     raw = (s1 + s3 + s6) / total if total > 0 else 0.0
-    return max(-GLOBAL_MAX_LEVERAGE, min(GLOBAL_MAX_LEVERAGE, raw))
+    
+    return raw
 
 # --- Execution Engine ---
 
@@ -303,9 +305,6 @@ def limit_chaser(api, side, size, start_price):
             else:
                 log.warning(f"Chaser Rejected: {resp}")
                 # Likely "would execute". Since we strictly want post-only, we skip this cycle
-                # But we don't break, maybe price moves back.
-                # However, if we need to fill, maybe we should accept taking liquidity?
-                # User said "NO Market Orders". We stick to post-only.
                 order_id = None 
                 
         except Exception as e:
@@ -397,35 +396,33 @@ def run_cycle(api):
         log.info(f"[API_RES] get_accounts: {accts}")
         total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
         strat_cap = total_pv * CAP_SPLIT
-        log.info(f"PV: ${total_pv:.2f} | StratAlloc: ${strat_cap:.2f} | GlobalMaxLev: {GLOBAL_MAX_LEVERAGE}x")
+        log.info(f"PV: ${total_pv:.2f} | StratAlloc: ${strat_cap:.2f} | GlobalMult: {GLOBAL_LEVERAGE_MULTIPLIER}x")
     except Exception as e:
         log.error(f"Account error: {e}")
         return
     
-    # Calculate Signals (Already capped by GLOBAL_MAX inside functions)
+    # Calculate Signals
     lev_planner = run_planner(df_1d, state, strat_cap)
     lev_tumbler = run_tumbler(df_1d, state, strat_cap)
     lev_gainer = run_gainer(df_1h, df_1d)
     
-    log.info(f"Sigs (Capped) | Plan: {lev_planner:.2f} | Tumb: {lev_tumbler:.2f} | Gain: {lev_gainer:.2f}")
+    log.info(f"Sigs | Plan: {lev_planner:.2f} | Tumb: {lev_tumbler:.2f} | Gain: {lev_gainer:.2f}")
     
     notional_planner = lev_planner * strat_cap
     notional_tumbler = lev_tumbler * strat_cap
     notional_gainer = lev_gainer * strat_cap
     
-    net_notional = notional_planner + notional_tumbler + notional_gainer
-    target_qty = net_notional / curr_price
+    raw_net_notional = notional_planner + notional_tumbler + notional_gainer
     
-    # Apply Global Leverage Cap to TOTAL Position as well (Safety Net)
-    max_qty = (total_pv * GLOBAL_MAX_LEVERAGE) / curr_price
-    if abs(target_qty) > max_qty:
-        log.warning(f"Target {target_qty} exceeds Global Max {max_qty}. Clamping.")
-        target_qty = max_qty if target_qty > 0 else -max_qty
-
+    # MODIFIED: APPLY GLOBAL MULTIPLIER to the FINAL Aggregate Position
+    final_net_notional = raw_net_notional * GLOBAL_LEVERAGE_MULTIPLIER
+    
+    target_qty = final_net_notional / curr_price
+    
     curr_qty = get_net_position(api)
     delta = target_qty - curr_qty
     
-    log.info(f"Net Notional: ${net_notional:.2f} | Tgt: {target_qty:.4f} | Curr: {curr_qty:.4f} | Delta: {delta:.4f}")
+    log.info(f"RawNotional: ${raw_net_notional:.2f} | FinalNotional (4x): ${final_net_notional:.2f} | Tgt: {target_qty:.4f} | Delta: {delta:.4f}")
     
     if abs(delta) >= MIN_TRADE_SIZE:
         side = "buy" if delta > 0 else "sell"
