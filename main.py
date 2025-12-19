@@ -7,7 +7,7 @@ Features:
 - Net Leverage Aggregation (Internal Netting).
 - Execution: Limit Chaser (Post-Only) - NO Market Orders.
 - Independent Virtual Stop Losses.
-- DEBUG: Full API Response Logging enabled.
+- FIX: Strict size rounding and checks to prevent 'invalidSize' errors.
 """
 
 import json
@@ -30,7 +30,7 @@ CAP_SPLIT = 0.333  # Equal split
 # Execution Settings
 LIMIT_CHASE_DURATION = 720  # 12 minutes
 CHASE_INTERVAL = 60         # Update every minute
-MIN_TRADE_SIZE = 0.0001
+MIN_TRADE_SIZE = 0.0002     # Safe minimum to avoid invalidSize errors
 LIMIT_OFFSET_TICKS = 1      # Start 1 tick away from spread
 
 # Logging
@@ -256,10 +256,13 @@ def limit_chaser(api, side, size, start_price):
     """
     if dry: return
     
-    tick_size = 1.0 # Fixed Maturity is integer usually
-    
+    # Strict rounding to 4 decimals to avoid invalidSize
+    size = round(size, 4)
+    if size < MIN_TRADE_SIZE:
+        log.warning(f"Chaser Skipped: Size {size} < Min {MIN_TRADE_SIZE}")
+        return
+
     # Initial Price (Deep Maker)
-    # Buy: Price - Offset, Sell: Price + Offset
     if side == "buy": limit_px = int(start_price - LIMIT_OFFSET_TICKS)
     else: limit_px = int(start_price + LIMIT_OFFSET_TICKS)
     
@@ -292,11 +295,10 @@ def limit_chaser(api, side, size, start_price):
                 order_id = resp["sendStatus"]["order_id"]
                 log.info(f"Chaser [{i}]: Placed @ {limit_px} (ID: {order_id})")
             else:
-                log.warning(f"Chaser rejected/filled immediately or error: {resp}")
-                # If rejected because it would cross, we might be filled or market moved against us
-                # In strict post-only, this means we are too aggressive.
-                # Back off slightly? Or just break and re-evaluate next loop.
-                # For now, break loop to re-check position
+                log.warning(f"Chaser rejected: {resp}")
+                # Common reject for postOnly is 'would execute' -> Means we are crossing spread.
+                # Since we want NO market orders, we should just break or retry.
+                # For safety, break to re-evaluate state.
                 break
                 
         except Exception as e:
@@ -317,7 +319,6 @@ def limit_chaser(api, side, size, start_price):
                     ask = float(t["ask"])
                     
                     if side == "buy":
-                        # Move to Bid
                         limit_px = int(bid)
                     else:
                         limit_px = int(ask)
@@ -335,6 +336,7 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     Places independent stops for each strategy logic on the single netted position.
     Uses Reduce-Only.
     """
+    net_size = round(net_size, 4)
     if dry or abs(net_size) < MIN_TRADE_SIZE: 
         log.info(f"Skipping stops: Net Size {net_size} < Min")
         return
@@ -345,23 +347,17 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     
     # 1. Planner Stops (Trailing)
     p_net_lev = run_planner(state["df_1d"], state, cap_per_strat) # Re-calc to get lev
-    # Actually we stored state, use that
-    # S1 Stop
-    if abs(p_net_lev) > 0.01: # Simplified: Assuming full exposure if active
+    if abs(p_net_lev) > 0.01: 
         peak = state["planner"]["peak_equity"] or cap_per_strat
-        loss_allow = peak * (1 - PLANNER_PARAMS["S1_STOP"]) - cap_per_strat
         # Direction
-        d = 1 if net_size > 0 else -1
         side = "sell" if net_size > 0 else "buy"
         
         # Stop px
-        # Simplified Robust Logic:
-        # Calculate Stop Price based on Entry/Peak Price logic.
         stop_px = int(price * (1 - PLANNER_PARAMS["S1_STOP"])) if side == "sell" else int(price * (1 + PLANNER_PARAMS["S1_STOP"]))
         
         # Size: 1/3 of total position (approx)
         qty = round(abs(net_size) * 0.33, 4)
-        if qty > MIN_TRADE_SIZE:
+        if qty >= MIN_TRADE_SIZE:
             try:
                 payload = {
                     "orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, 
@@ -373,11 +369,10 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
             except Exception as e: log.error(f"Planner Stop failed: {e}")
 
     # 2. Tumbler Stop (Static)
-    # Similar logic, 4.3% from current price
     side = "sell" if net_size > 0 else "buy"
     stop_px = int(price * (1 - TUMBLER_PARAMS["STOP"])) if side == "sell" else int(price * (1 + TUMBLER_PARAMS["STOP"]))
     qty = round(abs(net_size) * 0.33, 4)
-    if qty > MIN_TRADE_SIZE:
+    if qty >= MIN_TRADE_SIZE:
         try:
              payload = {
                 "orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, 
@@ -427,10 +422,6 @@ def run_cycle(api):
     log.info(f"Signals | Plan: {lev_planner:.2f} | Tumb: {lev_tumbler:.2f} | Gain: {lev_gainer:.2f}")
     
     # 4. Netting
-    # Planner & Tumbler use Leverage * Capital
-    # Gainer uses Leverage * Capital
-    # Sum of Notional USD
-    
     notional_planner = lev_planner * strat_cap
     notional_tumbler = lev_tumbler * strat_cap
     notional_gainer = lev_gainer * strat_cap
