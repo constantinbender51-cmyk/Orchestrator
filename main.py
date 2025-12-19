@@ -9,6 +9,7 @@ Features:
 - Independent Virtual Stop Losses.
 - FIX: 'Order Stacking' bug (strict cancel before replace).
 - FIX: Strict size rounding and checks to prevent 'invalidSize' errors.
+- LOGGING: Full API response logging for debugging.
 """
 
 import json
@@ -107,6 +108,7 @@ def get_sma(prices, window):
 def get_market_price(api):
     try:
         resp = api.get_tickers()
+        log.info(f"[API_RES] get_tickers: {resp}")
         for t in resp.get("tickers", []):
             if t.get("symbol") == SYMBOL_FUTS: 
                 return float(t.get("markPrice"))
@@ -116,6 +118,7 @@ def get_market_price(api):
 def get_net_position(api):
     try:
         resp = api.get_open_positions()
+        log.info(f"[API_RES] get_open_positions: {resp}")
         for p in resp.get("openPositions", []):
             if p.get('symbol') == SYMBOL_FUTS:
                 size = float(p.get('size', 0.0))
@@ -268,7 +271,8 @@ def limit_chaser(api, side, size, start_price):
             # 1. CRITICAL: Cancel Old Order First
             if order_id:
                 try:
-                    api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
+                    c_resp = api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
+                    log.info(f"[API_RES] cancel_order: {c_resp}")
                 except Exception as e:
                     # If cancel fails (e.g. already filled), we must stop chasing
                     log.warning(f"Cancel failed (Filled?): {e}")
@@ -276,7 +280,9 @@ def limit_chaser(api, side, size, start_price):
             
             # Double check: Cancel All for this symbol just in case ID tracking failed
             if i == 0: 
-                 try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+                 try: 
+                    ca_resp = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+                    log.info(f"[API_RES] cancel_all_orders: {ca_resp}")
                  except: pass
 
             # 2. Place New Order
@@ -290,6 +296,7 @@ def limit_chaser(api, side, size, start_price):
             }
             log.info(f"Chaser [{i}] Sending: {limit_px}")
             resp = api.send_order(payload)
+            log.info(f"[API_RES] send_order: {resp}")
             
             if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                 order_id = resp["sendStatus"]["order_id"]
@@ -308,9 +315,10 @@ def limit_chaser(api, side, size, start_price):
         time.sleep(CHASE_INTERVAL)
         
         # 3. Update Price
-        tk = api.get_tickers()
         try:
-            for t in tk["tickers"]:
+            resp_tk = api.get_tickers()
+            log.info(f"[API_RES] get_tickers (chaser): {resp_tk}")
+            for t in resp_tk.get("tickers", []):
                 if t["symbol"] == SYMBOL_FUTS:
                     bid = float(t["bid"])
                     ask = float(t["ask"])
@@ -321,10 +329,12 @@ def limit_chaser(api, side, size, start_price):
                     else:
                         limit_px = int(ask)
                     break
-        except: pass
+        except Exception as e: log.error(f"Chaser ticker update failed: {e}")
         
     # Cleanup at end
-    try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+    try: 
+        ca_resp_end = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+        log.info(f"[API_RES] cancel_all_orders (cleanup): {ca_resp_end}")
     except: pass
 
 
@@ -332,7 +342,9 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     net_size = round(net_size, 4)
     if dry or abs(net_size) < MIN_TRADE_SIZE: return
     
-    try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+    try: 
+        ca_resp = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+        log.info(f"[API_RES] cancel_all_orders (stops): {ca_resp}")
     except: pass
     
     # 1. Planner Stops
@@ -343,10 +355,11 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
         qty = round(abs(net_size) * 0.33, 4)
         if qty >= MIN_TRADE_SIZE:
             try:
-                api.send_order({
+                s_resp = api.send_order({
                     "orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, 
                     "size": qty, "stopPrice": stop_px, "reduceOnly": True
                 })
+                log.info(f"[API_RES] send_order (planner stop): {s_resp}")
             except Exception as e: log.error(f"Planner Stop failed: {e}")
 
     # 2. Tumbler Stop
@@ -355,10 +368,11 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     qty = round(abs(net_size) * 0.33, 4)
     if qty >= MIN_TRADE_SIZE:
         try:
-             api.send_order({
+             s_resp_t = api.send_order({
                 "orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, 
                 "size": qty, "stopPrice": stop_px, "reduceOnly": True
             })
+             log.info(f"[API_RES] send_order (tumbler stop): {s_resp_t}")
         except: pass
 
 
@@ -380,6 +394,7 @@ def run_cycle(api):
     
     try:
         accts = api.get_accounts()
+        log.info(f"[API_RES] get_accounts: {accts}")
         total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
         strat_cap = total_pv * CAP_SPLIT
         log.info(f"PV: ${total_pv:.2f} | StratAlloc: ${strat_cap:.2f} | GlobalMaxLev: {GLOBAL_MAX_LEVERAGE}x")
