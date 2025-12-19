@@ -3,10 +3,9 @@
 master_trader.py - Unified Orchestrator for Planner, Tumbler, and Gainer
 Target: FF_XBTUSD_260130 (Fixed Jan 2030)
 Features:
-- Position-Aware Limit Chaser: Re-checks position every minute.
-- Stops immediately if target is reached.
-- Handles partial fills automatically.
-- Full API Response Logging.
+- Position-Aware Limit Chaser.
+- Concise Status Logging (Log only result/status fields).
+- Handles partial fills and avoids double-buys.
 """
 
 import json
@@ -83,7 +82,6 @@ def load_state():
 
 def save_state(state):
     try:
-        # Filter out non-serializable objects (like DataFrames) before saving
         serializable_state = {k: v for k, v in state.items() if k != "df_1d"}
         with open(STATE_FILE, "w") as f: json.dump(serializable_state, f, indent=2)
     except Exception as e: log.error(f"State save error: {e}")
@@ -122,11 +120,9 @@ def run_planner(df_1d, state, capital):
             if not s["stopped"]: log.info(f"Planner S1 Soft Stop Triggered (DD: {dd*100:.2f}%)")
             s["stopped"] = True
     else: s["peak_equity"] = capital
-
     price = df_1d['close'].iloc[-1]
     sma120 = get_sma(df_1d['close'], PLANNER_PARAMS["S1_SMA"])
     sma400 = get_sma(df_1d['close'], PLANNER_PARAMS["S2_SMA"])
-
     s1_lev = 0.0
     if price > sma120:
         if not s["stopped"]:
@@ -140,7 +136,6 @@ def run_planner(df_1d, state, capital):
         s["peak_equity"] = capital
         s["entry_date"] = datetime.now(timezone.utc).isoformat()
         s1_lev = -1.0
-
     s2_lev = 1.0 if price > sma400 else 0.0
     if capital > s["peak_equity"]: s["peak_equity"] = capital
     return max(-2.0, min(2.0, s1_lev + s2_lev))
@@ -154,11 +149,9 @@ def run_tumbler(df_1d, state, capital):
     lev = TUMBLER_PARAMS["LEVS"][2]
     if iii < TUMBLER_PARAMS["III_TH"][0]: lev = TUMBLER_PARAMS["LEVS"][0]
     elif iii < TUMBLER_PARAMS["III_TH"][1]: lev = TUMBLER_PARAMS["LEVS"][1]
-    
     if iii < TUMBLER_PARAMS["FLAT_THRESH"]:
         if not s["flat_regime"]: log.info(f"Tumbler: Entering Flat Regime (III={iii:.4f})")
         s["flat_regime"] = True
-    
     if s["flat_regime"]:
         sma1 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA1"])
         sma2 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA2"])
@@ -167,7 +160,6 @@ def run_tumbler(df_1d, state, capital):
         if abs(curr - sma1) <= sma1*b or abs(curr - sma2) <= sma2*b:
              log.info("Tumbler: Releasing Flat Regime")
              s["flat_regime"] = False
-    
     if s["flat_regime"]: return 0.0
     sma1 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA1"])
     sma2 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA2"])
@@ -207,25 +199,18 @@ def run_gainer(df_1h, df_1d):
 
 def limit_chaser(api, target_qty):
     """
-    Position-Aware Limit Chaser.
-    Iteratively checks the 'delta' between target_qty and actual position.
-    Stops if delta is negligible.
+    Position-Aware Limit Chaser with concise logging.
     """
     if dry: return
-    
     log.info(f"Starting Limit Chaser. Target Net Position: {target_qty:.4f}")
     order_id = None
     
-    # 1. Loop Duration (e.g. 12 minutes)
     for i in range(int(LIMIT_CHASE_DURATION / CHASE_INTERVAL)):
-        
-        # 2. Get LIVE Position & Calculate Delta
         curr_pos = get_net_position(api)
         delta = target_qty - curr_pos
         
-        # 3. Check Completion
         if abs(delta) < MIN_TRADE_SIZE:
-            log.info(f"Chaser Complete: Delta {delta:.4f} < Min {MIN_TRADE_SIZE}. Target Reached.")
+            log.info(f"Chaser Complete: Target reached (Pos: {curr_pos:.4f})")
             if order_id:
                 try: api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
                 except: pass
@@ -234,72 +219,47 @@ def limit_chaser(api, target_qty):
         side = "buy" if delta > 0 else "sell"
         size = round(abs(delta), 4)
         
-        log.info(f"Chaser Step {i+1}: Current: {curr_pos:.4f} | Target: {target_qty:.4f} | Need: {side} {size}")
-
-        # 4. Get Price for Limit
         limit_px = 0
         try:
             tk = api.get_tickers()
             for t in tk["tickers"]:
                 if t["symbol"] == SYMBOL_FUTS:
-                    # Buy at Bid, Sell at Ask (Maker/Post-Only)
                     limit_px = int(float(t["bid"])) if side == "buy" else int(float(t["ask"]))
-                    
-                    # Apply offset (optional logic from original script)
-                    if side == "buy": limit_px -= LIMIT_OFFSET_TICKS
-                    else: limit_px += LIMIT_OFFSET_TICKS
+                    limit_px += (-LIMIT_OFFSET_TICKS if side == "buy" else LIMIT_OFFSET_TICKS)
                     break
         except Exception as e:
             log.error(f"Ticker fetch failed: {e}")
             time.sleep(5)
             continue
             
-        if limit_px == 0:
-            log.warning("Could not determine limit price, skipping step.")
-            time.sleep(5)
-            continue
-
-        # 5. Cancel Previous & Place New
         try:
             if order_id:
                 api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
             
-            payload = {
-                "orderType": "lmt", 
-                "symbol": SYMBOL_FUTS, 
-                "side": side, 
-                "size": size, 
-                "limitPrice": limit_px,
-                "postOnly": True
-            }
-            log.info(f"Sending Order Request: {json.dumps(payload)}")
+            payload = {"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": size, "limitPrice": limit_px, "postOnly": True}
             resp = api.send_order(payload)
-            log.info(f"Full API Response (Order): {json.dumps(resp, indent=2)}")
+            
+            # CONCISE LOGGING: Only Result and Status
+            result_str = resp.get("result", "unknown")
+            status_str = resp.get("sendStatus", {}).get("status", "unknown")
+            log.info(f"Order {i+1} [{side} {size} @ {limit_px}]: {result_str} | {status_str}")
             
             if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                 order_id = resp["sendStatus"]["order_id"]
-                log.info(f"Order Placed: {order_id} @ {limit_px}")
-            else:
-                log.warning("Order rejected (likely Post-Only crossing). Retrying next loop.")
-                # We do NOT break here; we wait and retry.
-                
         except Exception as e:
             log.error(f"Chaser Execution Error: {e}")
         
-        # 6. Wait for next interval
         time.sleep(CHASE_INTERVAL)
         
-    # Cleanup at end of duration
     try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
     except: pass
 
 def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     """
-    Places independent stops with full API response logging.
+    Places stops with concise status logging.
     """
     net_size = round(net_size, 4)
     if dry or abs(net_size) < MIN_TRADE_SIZE: return
-    
     try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
     except: pass
     
@@ -308,87 +268,53 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     if qty < MIN_TRADE_SIZE: return
 
     # 1. Planner Stop
-    stop_px_planner = int(price * (1 - PLANNER_PARAMS["S1_STOP"])) if side == "sell" else int(price * (1 + PLANNER_PARAMS["S1_STOP"]))
+    stop_px = int(price * (1 - PLANNER_PARAMS["S1_STOP"])) if side == "sell" else int(price * (1 + PLANNER_PARAMS["S1_STOP"]))
     try:
-        payload = {
-            "orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, 
-            "size": qty, "stopPrice": stop_px_planner, "reduceOnly": True
-        }
-        log.info(f"Sending Planner Stop Request: {json.dumps(payload)}")
-        resp = api.send_order(payload)
-        log.info(f"Full API Response (Planner Stop): {json.dumps(resp, indent=2)}")
-    except Exception as e: log.error(f"Planner Stop failed: {e}")
+        resp = api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty, "stopPrice": stop_px, "reduceOnly": True})
+        log.info(f"Planner Stop: {resp.get('result')} | {resp.get('sendStatus', {}).get('status')}")
+    except: pass
 
     # 2. Tumbler Stop
-    stop_px_tumbler = int(price * (1 - TUMBLER_PARAMS["STOP"])) if side == "sell" else int(price * (1 + TUMBLER_PARAMS["STOP"]))
+    stop_px = int(price * (1 - TUMBLER_PARAMS["STOP"])) if side == "sell" else int(price * (1 + TUMBLER_PARAMS["STOP"]))
     try:
-        payload = {
-            "orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, 
-            "size": qty, "stopPrice": stop_px_tumbler, "reduceOnly": True
-        }
-        log.info(f"Sending Tumbler Stop Request: {json.dumps(payload)}")
-        resp = api.send_order(payload)
-        log.info(f"Full API Response (Tumbler Stop): {json.dumps(resp, indent=2)}")
-    except Exception as e: log.error(f"Tumbler Stop failed: {e}")
+        resp = api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty, "stopPrice": stop_px, "reduceOnly": True})
+        log.info(f"Tumbler Stop: {resp.get('result')} | {resp.get('sendStatus', {}).get('status')}")
+    except: pass
 
 def run_cycle(api):
     log.info(">>> CYCLE START <<<")
     try:
         df_1h = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 60)
         df_1d = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 1440)
-    except Exception as e:
-        log.error(f"Failed to fetch OHLC data: {e}")
-        return
-
+    except: return
     state = load_state()
     state["df_1d"] = df_1d 
     curr_price = get_market_price(api) or df_1h['close'].iloc[-1]
-    
     try:
         accts = api.get_accounts()
-        total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
-        strat_cap = total_pv * CAP_SPLIT
-        log.info(f"Total PV: ${total_pv:.2f} | StratAlloc: ${strat_cap:.2f}")
-    except Exception as e:
-        log.error(f"Failed to get accounts: {e}")
-        return
+        strat_cap = float(accts["accounts"]["flex"]["portfolioValue"]) * CAP_SPLIT
+    except: return
     
-    lev_planner = run_planner(df_1d, state, strat_cap)
-    lev_tumbler = run_tumbler(df_1d, state, strat_cap)
-    lev_gainer = run_gainer(df_1h, df_1d)
+    lev_total = run_planner(df_1d, state, strat_cap) + run_tumbler(df_1d, state, strat_cap) + run_gainer(df_1h, df_1d)
+    target_qty = lev_total * strat_cap / curr_price
     
-    log.info(f"Signals | Plan: {lev_planner:.2f} | Tumb: {lev_tumbler:.2f} | Gain: {lev_gainer:.2f}")
-    
-    # Calculate Total Target Qty (Not just delta)
-    target_qty = (lev_planner + lev_tumbler + lev_gainer) * strat_cap / curr_price
-    
-    # Hand off to Position-Aware Chaser
-    # NOTE: The chaser checks current position internally now.
     limit_chaser(api, target_qty)
     
-    # Final cleanup & Stops
     final_pos = get_net_position(api)
     manage_virtual_stops(api, state, final_pos, curr_price, strat_cap)
-    
     save_state(state)
     log.info(">>> CYCLE END <<<")
 
 def wait_until_next_hour():
     now = datetime.now(timezone.utc)
     next_run = (now + timedelta(hours=1)).replace(minute=1, second=0, microsecond=0)
-    wait = (next_run - now).total_seconds()
-    log.info(f"Sleeping until {next_run.strftime('%H:%M')} ({wait/60:.1f}m)")
-    time.sleep(wait)
+    time.sleep((next_run - now).total_seconds())
 
 def main():
-    api_key = os.getenv("KRAKEN_API_KEY")
-    api_sec = os.getenv("KRAKEN_API_SECRET")
+    api_key, api_sec = os.getenv("KRAKEN_API_KEY"), os.getenv("KRAKEN_API_SECRET")
     if not api_key: sys.exit("No API Keys")
     api = kf.KrakenFuturesApi(api_key, api_sec)
-    
-    if os.getenv("RUN_TRADE_NOW", "false").lower() in {"1", "true", "yes"}:
-        run_cycle(api)
-        
+    if os.getenv("RUN_TRADE_NOW", "false").lower() in {"1", "true", "yes"}: run_cycle(api)
     while True:
         wait_until_next_hour()
         run_cycle(api)
