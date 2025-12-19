@@ -8,8 +8,7 @@ Features:
 - Execution: Limit Chaser (Post-Only).
 - Independent Virtual Stop Losses.
 - FIX: 'Order Stacking' bug (strict cancel before replace).
-- FIX: Strict size rounding and checks to prevent 'invalidSize' errors.
-- LOGGING: Full API response logging for debugging.
+- LOGGING: Only logs order sending API responses.
 """
 
 import json
@@ -32,7 +31,7 @@ SYMBOL_OHLC = "XBTUSD"
 CAP_SPLIT = 0.333  
 
 # GLOBAL LEVERAGE CONTROL
-# Cap removed (set to 50.0). Logic will now follow raw strategy output or high leverage.
+# Cap effectively removed (set to 50.0).
 GLOBAL_MAX_LEVERAGE = 50.0 
 
 # Execution Settings
@@ -64,7 +63,6 @@ PLANNER_PARAMS = {
 TUMBLER_PARAMS = {
     "SMA1": 32, "SMA2": 114, "STOP": 0.043, "TP": 0.126,
     "III_WIN": 27, "FLAT_THRESH": 0.356, "BAND": 0.077,
-    # These raw leverage values will be scaled down by GLOBAL_MAX_LEVERAGE logic later
     "LEVS": [0.079, 4.327, 3.868], "III_TH": [0.058, 0.259]
 }
 
@@ -108,7 +106,6 @@ def get_sma(prices, window):
 def get_market_price(api):
     try:
         resp = api.get_tickers()
-        log.info(f"[API_RES] get_tickers: {resp}")
         for t in resp.get("tickers", []):
             if t.get("symbol") == SYMBOL_FUTS: 
                 return float(t.get("markPrice"))
@@ -118,7 +115,6 @@ def get_market_price(api):
 def get_net_position(api):
     try:
         resp = api.get_open_positions()
-        log.info(f"[API_RES] get_open_positions: {resp}")
         for p in resp.get("openPositions", []):
             if p.get('symbol') == SYMBOL_FUTS:
                 size = float(p.get('size', 0.0))
@@ -129,7 +125,6 @@ def get_net_position(api):
 # --- Strategy Modules ---
 
 def run_planner(df_1d, state, capital):
-    """Returns Raw Target Leverage (-2.0 to 2.0)"""
     s = state["planner"]
     if s["peak_equity"] < capital: s["peak_equity"] = capital 
     
@@ -161,16 +156,10 @@ def run_planner(df_1d, state, capital):
     s2_lev = 1.0 if price > sma400 else 0.0
     if capital > s["peak_equity"]: s["peak_equity"] = capital
     
-    # Raw leverage from strategy logic
     raw_net = s1_lev + s2_lev
-    
-    # Cap individual strategy at Global Max? 
-    # Or let aggregation handle it? 
-    # Usually better to clamp here first to keep 'virtual' size sane.
     return max(-GLOBAL_MAX_LEVERAGE, min(GLOBAL_MAX_LEVERAGE, raw_net))
 
 def run_tumbler(df_1d, state, capital):
-    """Returns Target Leverage"""
     s = state["tumbler"]
     w = TUMBLER_PARAMS["III_WIN"]
     if len(df_1d) < w+1: return 0.0
@@ -178,17 +167,11 @@ def run_tumbler(df_1d, state, capital):
     log_ret = np.log(df_1d['close'] / df_1d['close'].shift(1))
     iii = (log_ret.rolling(w).sum().abs() / log_ret.abs().rolling(w).sum()).fillna(0).iloc[-1]
     
-    # Original logic produced 4x. We must scale this.
-    # If III indicates 'High Conviction', we go to GLOBAL_MAX.
-    # If 'Low', we go to fraction.
+    scale_factor = GLOBAL_MAX_LEVERAGE 
+    lev = scale_factor 
+    if iii < TUMBLER_PARAMS["III_TH"][0]: lev = scale_factor * 0.2 
+    elif iii < TUMBLER_PARAMS["III_TH"][1]: lev = scale_factor 
     
-    scale_factor = GLOBAL_MAX_LEVERAGE # Now 50.0 (Uncapped)
-    
-    lev = scale_factor # Default High
-    if iii < TUMBLER_PARAMS["III_TH"][0]: lev = scale_factor * 0.2 # Low (0.2x)
-    elif iii < TUMBLER_PARAMS["III_TH"][1]: lev = scale_factor # Mid (1.0x)
-    
-    # Flat Regime
     if iii < TUMBLER_PARAMS["FLAT_THRESH"]:
         if not s["flat_regime"]: log.info(f"Tumbler: Entering Flat Regime (III={iii:.4f})")
         s["flat_regime"] = True
@@ -213,7 +196,6 @@ def run_tumbler(df_1d, state, capital):
     return 0.0
 
 def run_gainer(df_1h, df_1d):
-    """Returns Target Leverage (-1.0 to 1.0)"""
     def calc_macd(prices, params, weights):
         comp = 0.0
         for (f,s,sig), w in zip(params, weights):
@@ -247,10 +229,6 @@ def run_gainer(df_1h, df_1d):
 # --- Execution Engine ---
 
 def limit_chaser(api, side, size, start_price):
-    """
-    Executes a Post-Only Limit Order.
-    FIX: Cancels previous order BEFORE placing new one to prevent stacking.
-    """
     if dry: return
     
     size = round(size, 4)
@@ -258,54 +236,36 @@ def limit_chaser(api, side, size, start_price):
         log.warning(f"Chaser Skipped: Size {size} < Min {MIN_TRADE_SIZE}")
         return
 
-    # Initial Price
     if side == "buy": limit_px = int(start_price - LIMIT_OFFSET_TICKS)
     else: limit_px = int(start_price + LIMIT_OFFSET_TICKS)
     
     log.info(f"Starting Limit Chaser: {side} {size} @ {limit_px}")
-    
     order_id = None
     
     for i in range(int(LIMIT_CHASE_DURATION / CHASE_INTERVAL)):
         try:
-            # 1. CRITICAL: Cancel Old Order First
             if order_id:
                 try:
-                    c_resp = api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
-                    log.info(f"[API_RES] cancel_order: {c_resp}")
-                except Exception as e:
-                    # If cancel fails (e.g. already filled), we must stop chasing
-                    log.warning(f"Cancel failed (Filled?): {e}")
+                    api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
+                except Exception:
                     break
             
-            # Double check: Cancel All for this symbol just in case ID tracking failed
             if i == 0: 
-                 try: 
-                    ca_resp = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
-                    log.info(f"[API_RES] cancel_all_orders: {ca_resp}")
+                 try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
                  except: pass
 
-            # 2. Place New Order
             payload = {
-                "orderType": "lmt", 
-                "symbol": SYMBOL_FUTS, 
-                "side": side, 
-                "size": size, 
-                "limitPrice": limit_px,
-                "postOnly": True
+                "orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, 
+                "size": size, "limitPrice": limit_px, "postOnly": True
             }
             log.info(f"Chaser [{i}] Sending: {limit_px}")
             resp = api.send_order(payload)
+            # LOGGING: Order send responses only
             log.info(f"[API_RES] send_order: {resp}")
             
             if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                 order_id = resp["sendStatus"]["order_id"]
             else:
-                log.warning(f"Chaser Rejected: {resp}")
-                # Likely "would execute". Since we strictly want post-only, we skip this cycle
-                # But we don't break, maybe price moves back.
-                # However, if we need to fill, maybe we should accept taking liquidity?
-                # User said "NO Market Orders". We stick to post-only.
                 order_id = None 
                 
         except Exception as e:
@@ -314,27 +274,16 @@ def limit_chaser(api, side, size, start_price):
             
         time.sleep(CHASE_INTERVAL)
         
-        # 3. Update Price
         try:
             resp_tk = api.get_tickers()
-            log.info(f"[API_RES] get_tickers (chaser): {resp_tk}")
             for t in resp_tk.get("tickers", []):
                 if t["symbol"] == SYMBOL_FUTS:
-                    bid = float(t["bid"])
-                    ask = float(t["ask"])
-                    
-                    if side == "buy":
-                        # Converge to Best Bid
-                        limit_px = int(bid)
-                    else:
-                        limit_px = int(ask)
+                    bid, ask = float(t["bid"]), float(t["ask"])
+                    limit_px = int(bid) if side == "buy" else int(ask)
                     break
-        except Exception as e: log.error(f"Chaser ticker update failed: {e}")
+        except Exception: pass
         
-    # Cleanup at end
-    try: 
-        ca_resp_end = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
-        log.info(f"[API_RES] cancel_all_orders (cleanup): {ca_resp_end}")
+    try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
     except: pass
 
 
@@ -342,9 +291,7 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     net_size = round(net_size, 4)
     if dry or abs(net_size) < MIN_TRADE_SIZE: return
     
-    try: 
-        ca_resp = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
-        log.info(f"[API_RES] cancel_all_orders (stops): {ca_resp}")
+    try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
     except: pass
     
     # 1. Planner Stops
@@ -359,8 +306,9 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
                     "orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, 
                     "size": qty, "stopPrice": stop_px, "reduceOnly": True
                 })
+                # LOGGING: Order send responses only
                 log.info(f"[API_RES] send_order (planner stop): {s_resp}")
-            except Exception as e: log.error(f"Planner Stop failed: {e}")
+            except Exception: pass
 
     # 2. Tumbler Stop
     side = "sell" if net_size > 0 else "buy"
@@ -372,13 +320,13 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
                 "orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, 
                 "size": qty, "stopPrice": stop_px, "reduceOnly": True
             })
+             # LOGGING: Order send responses only
              log.info(f"[API_RES] send_order (tumbler stop): {s_resp_t}")
         except: pass
 
 
 def run_cycle(api):
     log.info(">>> CYCLE START <<<")
-    
     try:
         df_1h = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 60)
         df_1d = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 1440)
@@ -388,13 +336,11 @@ def run_cycle(api):
 
     state = load_state()
     state["df_1d"] = df_1d 
-    
     curr_price = get_market_price(api)
     if curr_price == 0: curr_price = df_1h['close'].iloc[-1]
     
     try:
         accts = api.get_accounts()
-        log.info(f"[API_RES] get_accounts: {accts}")
         total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
         strat_cap = total_pv * CAP_SPLIT
         log.info(f"PV: ${total_pv:.2f} | StratAlloc: ${strat_cap:.2f} | GlobalMaxLev: {GLOBAL_MAX_LEVERAGE}x")
@@ -402,12 +348,11 @@ def run_cycle(api):
         log.error(f"Account error: {e}")
         return
     
-    # Calculate Signals (Already capped by GLOBAL_MAX inside functions)
     lev_planner = run_planner(df_1d, state, strat_cap)
     lev_tumbler = run_tumbler(df_1d, state, strat_cap)
     lev_gainer = run_gainer(df_1h, df_1d)
     
-    log.info(f"Sigs (Capped) | Plan: {lev_planner:.2f} | Tumb: {lev_tumbler:.2f} | Gain: {lev_gainer:.2f}")
+    log.info(f"Sigs | Plan: {lev_planner:.2f} | Tumb: {lev_tumbler:.2f} | Gain: {lev_gainer:.2f}")
     
     notional_planner = lev_planner * strat_cap
     notional_tumbler = lev_tumbler * strat_cap
@@ -416,10 +361,8 @@ def run_cycle(api):
     net_notional = notional_planner + notional_tumbler + notional_gainer
     target_qty = net_notional / curr_price
     
-    # Apply Global Leverage Cap to TOTAL Position as well (Safety Net)
     max_qty = (total_pv * GLOBAL_MAX_LEVERAGE) / curr_price
     if abs(target_qty) > max_qty:
-        log.warning(f"Target {target_qty} exceeds Global Max {max_qty}. Clamping.")
         target_qty = max_qty if target_qty > 0 else -max_qty
 
     curr_qty = get_net_position(api)
@@ -430,17 +373,12 @@ def run_cycle(api):
     if abs(delta) >= MIN_TRADE_SIZE:
         side = "buy" if delta > 0 else "sell"
         limit_chaser(api, side, abs(delta), curr_price)
-        log.info("Sleeping 10s for position update...")
         time.sleep(10)
-    else:
-        log.info(f"Delta < Min, skipping.")
     
     final_pos = get_net_position(api)
     manage_virtual_stops(api, state, final_pos, curr_price, strat_cap)
-    
     save_state(state)
     log.info(">>> CYCLE END <<<")
-
 
 def wait_until_next_hour():
     now = datetime.now(timezone.utc)
@@ -459,7 +397,6 @@ def main():
     api = kf.KrakenFuturesApi(api_key, api_sec)
     
     if os.getenv("RUN_TRADE_NOW", "false").lower() in {"1", "true", "yes"}:
-        log.info("RUN_TRADE_NOW active")
         run_cycle(api)
         
     while True:
