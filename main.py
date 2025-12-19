@@ -4,8 +4,11 @@ master_trader.py - Unified Orchestrator for Planner, Tumbler, and Gainer
 Target: FF_XBTUSD_260130 (Fixed Jan 2030)
 Features:
 - Position-Aware Limit Chaser.
-- Concise Status Logging (Log only result/status fields).
-- Handles partial fills and avoids double-buys.
+- Concise Status Logging.
+- "Fair 2.0" Strategy Normalization:
+  - Planner: Max 2.0x (Preserved for Stop Logic).
+  - Tumbler: Scaled to Max 2.0x (from ~4.3x).
+  - Gainer: Scaled to Max 2.0x (from 1.0x).
 """
 
 import json
@@ -30,6 +33,10 @@ LIMIT_CHASE_DURATION = 720  # 12 minutes
 CHASE_INTERVAL = 60         # Update every minute
 MIN_TRADE_SIZE = 0.0002     # Safe minimum to avoid invalidSize errors
 LIMIT_OFFSET_TICKS = 1      # Start 1 tick away from spread
+
+# Normalization Constants (Targeting Max Leverage 2.0 per strategy)
+TUMBLER_MAX_LEV = 4.327
+TARGET_STRAT_LEV = 2.0
 
 # Logging
 logging.basicConfig(
@@ -112,6 +119,9 @@ def get_net_position(api):
 
 # --- Strategy Modules ---
 def run_planner(df_1d, state, capital):
+    """
+    Max Leverage: 2.0 (Native)
+    """
     s = state["planner"]
     if s["peak_equity"] < capital: s["peak_equity"] = capital
     if s["peak_equity"] > 0:
@@ -120,9 +130,11 @@ def run_planner(df_1d, state, capital):
             if not s["stopped"]: log.info(f"Planner S1 Soft Stop Triggered (DD: {dd*100:.2f}%)")
             s["stopped"] = True
     else: s["peak_equity"] = capital
+
     price = df_1d['close'].iloc[-1]
     sma120 = get_sma(df_1d['close'], PLANNER_PARAMS["S1_SMA"])
     sma400 = get_sma(df_1d['close'], PLANNER_PARAMS["S2_SMA"])
+
     s1_lev = 0.0
     if price > sma120:
         if not s["stopped"]:
@@ -136,11 +148,15 @@ def run_planner(df_1d, state, capital):
         s["peak_equity"] = capital
         s["entry_date"] = datetime.now(timezone.utc).isoformat()
         s1_lev = -1.0
+
     s2_lev = 1.0 if price > sma400 else 0.0
     if capital > s["peak_equity"]: s["peak_equity"] = capital
     return max(-2.0, min(2.0, s1_lev + s2_lev))
 
 def run_tumbler(df_1d, state, capital):
+    """
+    Max Leverage: 4.327 (Native) -> Will be normalized in run_cycle
+    """
     s = state["tumbler"]
     w = TUMBLER_PARAMS["III_WIN"]
     if len(df_1d) < w+1: return 0.0
@@ -149,9 +165,11 @@ def run_tumbler(df_1d, state, capital):
     lev = TUMBLER_PARAMS["LEVS"][2]
     if iii < TUMBLER_PARAMS["III_TH"][0]: lev = TUMBLER_PARAMS["LEVS"][0]
     elif iii < TUMBLER_PARAMS["III_TH"][1]: lev = TUMBLER_PARAMS["LEVS"][1]
+    
     if iii < TUMBLER_PARAMS["FLAT_THRESH"]:
         if not s["flat_regime"]: log.info(f"Tumbler: Entering Flat Regime (III={iii:.4f})")
         s["flat_regime"] = True
+    
     if s["flat_regime"]:
         sma1 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA1"])
         sma2 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA2"])
@@ -160,6 +178,7 @@ def run_tumbler(df_1d, state, capital):
         if abs(curr - sma1) <= sma1*b or abs(curr - sma2) <= sma2*b:
              log.info("Tumbler: Releasing Flat Regime")
              s["flat_regime"] = False
+    
     if s["flat_regime"]: return 0.0
     sma1 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA1"])
     sma2 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA2"])
@@ -169,6 +188,9 @@ def run_tumbler(df_1d, state, capital):
     return 0.0
 
 def run_gainer(df_1h, df_1d):
+    """
+    Max Leverage: 1.0 (Native) -> Will be normalized in run_cycle
+    """
     def calc_macd(prices, params, weights):
         comp = 0.0
         for (f,s,sig), w in zip(params, weights):
@@ -199,7 +221,7 @@ def run_gainer(df_1h, df_1d):
 
 def limit_chaser(api, target_qty):
     """
-    Position-Aware Limit Chaser with concise logging.
+    Position-Aware Limit Chaser.
     """
     if dry: return
     log.info(f"Starting Limit Chaser. Target Net Position: {target_qty:.4f}")
@@ -239,7 +261,7 @@ def limit_chaser(api, target_qty):
             payload = {"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": size, "limitPrice": limit_px, "postOnly": True}
             resp = api.send_order(payload)
             
-            # CONCISE LOGGING: Only Result and Status
+            # Concise Logging
             result_str = resp.get("result", "unknown")
             status_str = resp.get("sendStatus", {}).get("status", "unknown")
             log.info(f"Order {i+1} [{side} {size} @ {limit_px}]: {result_str} | {status_str}")
@@ -256,7 +278,7 @@ def limit_chaser(api, target_qty):
 
 def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     """
-    Places stops with concise status logging.
+    Places stops with concise logging.
     """
     net_size = round(net_size, 4)
     if dry or abs(net_size) < MIN_TRADE_SIZE: return
@@ -290,14 +312,31 @@ def run_cycle(api):
     state = load_state()
     state["df_1d"] = df_1d 
     curr_price = get_market_price(api) or df_1h['close'].iloc[-1]
+    
     try:
         accts = api.get_accounts()
-        strat_cap = float(accts["accounts"]["flex"]["portfolioValue"]) * CAP_SPLIT
+        total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
+        strat_cap = total_pv * CAP_SPLIT
+        log.info(f"Total PV: ${total_pv:.2f} | StratAlloc: ${strat_cap:.2f}")
     except: return
     
-    lev_total = run_planner(df_1d, state, strat_cap) + run_tumbler(df_1d, state, strat_cap) + run_gainer(df_1h, df_1d)
+    # 1. Raw Signals
+    raw_planner = run_planner(df_1d, state, strat_cap)
+    raw_tumbler = run_tumbler(df_1d, state, strat_cap)
+    raw_gainer = run_gainer(df_1h, df_1d)
+    
+    # 2. Fairness Normalization (Target Max 2.0x per Strat)
+    norm_planner = raw_planner # Already Max 2.0
+    norm_tumbler = raw_tumbler * (TARGET_STRAT_LEV / TUMBLER_MAX_LEV) # 4.3 -> 2.0
+    norm_gainer  = raw_gainer  * TARGET_STRAT_LEV # 1.0 -> 2.0
+    
+    log.info(f"Raw Levs  | Plan: {raw_planner:.2f} | Tumb: {raw_tumbler:.2f} | Gain: {raw_gainer:.2f}")
+    log.info(f"Fair Levs | Plan: {norm_planner:.2f} | Tumb: {norm_tumbler:.2f} | Gain: {norm_gainer:.2f}")
+
+    lev_total = norm_planner + norm_tumbler + norm_gainer
     target_qty = lev_total * strat_cap / curr_price
     
+    # 3. Execution
     limit_chaser(api, target_qty)
     
     final_pos = get_net_position(api)
