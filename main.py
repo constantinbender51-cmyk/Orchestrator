@@ -7,6 +7,7 @@ Features:
 - Net Leverage Aggregation (Internal Netting).
 - Execution: Limit Chaser (Post-Only) - NO Market Orders.
 - Independent Virtual Stop Losses.
+- DEBUG: Full API Response Logging enabled.
 """
 
 import json
@@ -100,8 +101,10 @@ def get_market_price(api):
     try:
         resp = api.get_tickers()
         for t in resp.get("tickers", []):
-            if t.get("symbol") == SYMBOL_FUTS: return float(t.get("markPrice"))
-    except: pass
+            if t.get("symbol") == SYMBOL_FUTS: 
+                log.info(f"Ticker Data: Bid={t.get('bid')} Ask={t.get('ask')} Last={t.get('last')}")
+                return float(t.get("markPrice"))
+    except Exception as e: log.error(f"Ticker fetch failed: {e}")
     return 0.0
 
 def get_net_position(api):
@@ -111,7 +114,7 @@ def get_net_position(api):
             if p.get('symbol') == SYMBOL_FUTS:
                 size = float(p.get('size', 0.0))
                 return size if p.get('side') == 'long' else -size
-    except: pass
+    except Exception as e: log.error(f"Pos fetch failed: {e}")
     return 0.0
 
 # --- Strategy Modules ---
@@ -127,7 +130,9 @@ def run_planner(df_1d, state, capital):
         dd = (s["peak_equity"] - capital) / s["peak_equity"]
         # Soft stop check (actual hard stops are placed on exchange)
         # We just track state here to prevent re-entry
-        if dd > PLANNER_PARAMS["S1_STOP"]: s["stopped"] = True
+        if dd > PLANNER_PARAMS["S1_STOP"]: 
+            if not s["stopped"]: log.info(f"Planner S1 Soft Stop Triggered (DD: {dd*100:.2f}%)")
+            s["stopped"] = True
     else: s["peak_equity"] = capital
 
     price = df_1d['close'].iloc[-1]
@@ -182,7 +187,7 @@ def run_tumbler(df_1d, state, capital):
     
     # Flat Regime
     if iii < TUMBLER_PARAMS["FLAT_THRESH"]:
-        if not s["flat_regime"]: log.info("Tumbler: Entering Flat Regime")
+        if not s["flat_regime"]: log.info(f"Tumbler: Entering Flat Regime (III={iii:.4f})")
         s["flat_regime"] = True
     
     # Release Check
@@ -270,21 +275,24 @@ def limit_chaser(api, side, size, start_price):
                 api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
             
             # Place new post-only
-            resp = api.send_order({
+            payload = {
                 "orderType": "lmt", 
                 "symbol": SYMBOL_FUTS, 
                 "side": side, 
                 "size": size, 
                 "limitPrice": limit_px,
                 "postOnly": True
-            })
+            }
+            log.info(f"Sending Order: {payload}")
+            resp = api.send_order(payload)
+            log.info(f"API Response: {resp}")
             
             # Check response
             if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                 order_id = resp["sendStatus"]["order_id"]
                 log.info(f"Chaser [{i}]: Placed @ {limit_px} (ID: {order_id})")
             else:
-                log.warning(f"Chaser rejected/filled immediately: {resp}")
+                log.warning(f"Chaser rejected/filled immediately or error: {resp}")
                 # If rejected because it would cross, we might be filled or market moved against us
                 # In strict post-only, this means we are too aggressive.
                 # Back off slightly? Or just break and re-evaluate next loop.
@@ -313,6 +321,7 @@ def limit_chaser(api, side, size, start_price):
                         limit_px = int(bid)
                     else:
                         limit_px = int(ask)
+                    log.info(f"Updating limit price to: {limit_px} (Bid:{bid}/Ask:{ask})")
                     break
         except: pass
         
@@ -326,7 +335,9 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     Places independent stops for each strategy logic on the single netted position.
     Uses Reduce-Only.
     """
-    if dry or abs(net_size) < MIN_TRADE_SIZE: return
+    if dry or abs(net_size) < MIN_TRADE_SIZE: 
+        log.info(f"Skipping stops: Net Size {net_size} < Min")
+        return
     
     # Clear old stops
     try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
@@ -344,10 +355,6 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
         side = "sell" if net_size > 0 else "buy"
         
         # Stop px
-        # Price + (NegAllowance / (NetSize * 0.33)) ?? 
-        # Correct logic: The stop is relative to the PORTION of the trade.
-        # But we are placing orders on the TOTAL position.
-        
         # Simplified Robust Logic:
         # Calculate Stop Price based on Entry/Peak Price logic.
         stop_px = int(price * (1 - PLANNER_PARAMS["S1_STOP"])) if side == "sell" else int(price * (1 + PLANNER_PARAMS["S1_STOP"]))
@@ -356,11 +363,13 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
         qty = round(abs(net_size) * 0.33, 4)
         if qty > MIN_TRADE_SIZE:
             try:
-                api.send_order({
+                payload = {
                     "orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, 
                     "size": qty, "stopPrice": stop_px, "reduceOnly": True
-                })
-                log.info(f"Placed Planner S1 Stop: {qty} @ {stop_px}")
+                }
+                log.info(f"Sending Stop: {payload}")
+                resp = api.send_order(payload)
+                log.info(f"Stop Response: {resp}")
             except Exception as e: log.error(f"Planner Stop failed: {e}")
 
     # 2. Tumbler Stop (Static)
@@ -370,11 +379,13 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     qty = round(abs(net_size) * 0.33, 4)
     if qty > MIN_TRADE_SIZE:
         try:
-             api.send_order({
+             payload = {
                 "orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, 
                 "size": qty, "stopPrice": stop_px, "reduceOnly": True
-            })
-             log.info(f"Placed Tumbler Stop: {qty} @ {stop_px}")
+            }
+             log.info(f"Sending Tumbler Stop: {payload}")
+             resp = api.send_order(payload)
+             log.info(f"Tumbler Stop Resp: {resp}")
         except: pass
 
 
@@ -382,19 +393,31 @@ def run_cycle(api):
     log.info(">>> CYCLE START <<<")
     
     # 1. Data
-    df_1h = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 60)
-    df_1d = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 1440)
+    try:
+        df_1h = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 60)
+        df_1d = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 1440)
+    except Exception as e:
+        log.error(f"Failed to fetch OHLC data: {e}")
+        return
+
     state = load_state()
     # Store df for internal use
     state["df_1d"] = df_1d 
     
     curr_price = get_market_price(api)
-    if curr_price == 0: curr_price = df_1h['close'].iloc[-1]
+    if curr_price == 0: 
+        log.warning("Market price 0, fallback to OHLC close")
+        curr_price = df_1h['close'].iloc[-1]
     
     # 2. Capital
-    accts = api.get_accounts()
-    total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
-    strat_cap = total_pv * CAP_SPLIT
+    try:
+        accts = api.get_accounts()
+        total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
+        strat_cap = total_pv * CAP_SPLIT
+        log.info(f"Total PV: ${total_pv:.2f} | StratAlloc: ${strat_cap:.2f}")
+    except Exception as e:
+        log.error(f"Failed to get accounts: {e}")
+        return
     
     # 3. Calculate Signals
     lev_planner = run_planner(df_1d, state, strat_cap)
@@ -426,7 +449,10 @@ def run_cycle(api):
         limit_chaser(api, side, abs(delta), curr_price)
         
         # 6. Verification Sleep
+        log.info("Sleeping 10s for position update...")
         time.sleep(10)
+    else:
+        log.info(f"Delta {delta:.4f} < Min {MIN_TRADE_SIZE}, skipping execution.")
     
     # 7. Stops
     final_pos = get_net_position(api)
@@ -449,9 +475,11 @@ def main():
     api_sec = os.getenv("KRAKEN_API_SECRET")
     if not api_key: sys.exit("No API Keys")
     
+    log.info("Initializing API...")
     api = kf.KrakenFuturesApi(api_key, api_sec)
     
     if os.getenv("RUN_TRADE_NOW", "false").lower() in {"1", "true", "yes"}:
+        log.info("RUN_TRADE_NOW active")
         run_cycle(api)
         
     while True:
