@@ -32,8 +32,8 @@ SYMBOL_OHLC = "XBTUSD"
 CAP_SPLIT = 0.333  
 
 # GLOBAL LEVERAGE CONTROL
-# Updated: This is a MULTIPLIER. If strategies sum to 1.0x, we execute 4.0x.
-GLOBAL_LEVERAGE_MULTIPLIER = 4.0
+# Updated: This is a MULTIPLIER. If strategies sum to 1.0x, we execute 2.0x.
+GLOBAL_LEVERAGE_MULTIPLIER = 2.0
 
 # Execution Settings
 LIMIT_CHASE_DURATION = 720  # 12 minutes
@@ -109,7 +109,8 @@ def get_sma(prices, window):
 def get_market_price(api):
     try:
         resp = api.get_tickers()
-        log.info(f"[API_RES] get_tickers: {resp}")
+        # Truncate log to 200 chars to avoid spam
+        log.info(f"[API_RES] get_tickers: {str(resp)[:200]}...")
         for t in resp.get("tickers", []):
             if t.get("symbol") == SYMBOL_FUTS: 
                 return float(t.get("markPrice"))
@@ -316,7 +317,8 @@ def limit_chaser(api, side, size, start_price):
         # 3. Update Price
         try:
             resp_tk = api.get_tickers()
-            log.info(f"[API_RES] get_tickers (chaser): {resp_tk}")
+            # Truncate log to 200 chars to avoid spam
+            log.info(f"[API_RES] get_tickers (chaser): {str(resp_tk)[:200]}...")
             for t in resp_tk.get("tickers", []):
                 if t["symbol"] == SYMBOL_FUTS:
                     bid = float(t["bid"])
