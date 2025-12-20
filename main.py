@@ -3,10 +3,10 @@
 master_trader.py - Unified Trading Engine & Observation Deck
 Features:
 - "Fair 2.0" Strategy Normalization.
-- Position-Aware Limit Chaser (Fixed: Uses Cancel-All to prevent stacking).
-- Built-in Web Server (Port 8080) for Real-Time Monitoring.
+- Position-Aware Limit Chaser.
+- Built-in Web Server (Port 8080).
 - Runs on Railway (Single Process).
-- Minimalistic Logging with Expandable API Responses in Dashboard.
+- No-Flicker Dashboard: Preserves expanded API details during updates.
 """
 
 import json
@@ -43,18 +43,16 @@ STATE_FILE = Path("master_state.json")
 PORT = int(os.getenv("PORT", 8080))
 
 # --- Logging Setup ---
-LOG_BUFFER = collections.deque(maxlen=200) # Keep last 200 logs for dashboard
+LOG_BUFFER = collections.deque(maxlen=200)
 
 class BufferHandler(logging.Handler):
-    """Stores logs in memory for the dashboard with HTML formatted details."""
+    """Stores logs with unique IDs to prevent frontend flickering."""
     def emit(self, record):
         try:
             msg = self.format(record)
-            # Check for extra 'api_response' context
             if hasattr(record, 'api_response'):
                 try:
                     json_str = json.dumps(record.api_response, indent=2)
-                    # Append HTML details block
                     msg += (
                         f"<details style='margin:5px 0 10px 0; border-left:2px solid #30363d; padding-left:10px;'>"
                         f"<summary style='cursor:pointer; color:#58a6ff; font-size:0.85em; outline:none;'>API Response</summary>"
@@ -62,7 +60,13 @@ class BufferHandler(logging.Handler):
                         f"</details>"
                     )
                 except: pass
-            LOG_BUFFER.append(msg)
+            
+            # Store as object with ID
+            entry = {
+                "id": str(time.time_ns()), 
+                "html": msg
+            }
+            LOG_BUFFER.append(entry)
         except Exception:
             self.handleError(record)
 
@@ -73,16 +77,14 @@ class SlowStreamHandler(logging.StreamHandler):
             msg = self.format(record)
             self.stream.write(msg + self.terminator)
             self.flush()
-            time.sleep(0.05) # Slightly faster but safe
+            time.sleep(0.05)
         except Exception:
             self.handleError(record)
 
 log = logging.getLogger("MASTER")
 log.setLevel(logging.INFO)
-# Minimal Time Format: [05:44]
 fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M")
 
-# Add Handlers
 slow_h = SlowStreamHandler(sys.stdout)
 slow_h.setFormatter(fmt)
 log.addHandler(slow_h)
@@ -129,6 +131,11 @@ def load_state():
                 saved = json.load(f)
                 for k, v in defaults.items():
                     if k not in saved: saved[k] = v
+                
+                # Migration: Ensure logs are objects
+                if saved["logs"] and isinstance(saved["logs"][0], str):
+                    saved["logs"] = [{"id": str(i), "html": l} for i, l in enumerate(saved["logs"])]
+                    
                 return saved
         except Exception as e: log.error(f"State load error: {e}")
     return defaults
@@ -274,7 +281,6 @@ def limit_chaser(api, target_qty):
     if dry: return
     log.info(f"Chase Start | Tgt: {target_qty:.4f}")
     
-    # Pre-emptive clear
     try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
     except: pass
     
@@ -282,7 +288,6 @@ def limit_chaser(api, target_qty):
         curr_pos = get_net_position(api)
         delta = target_qty - curr_pos
         
-        # 1. Done?
         if abs(delta) < MIN_TRADE_SIZE:
             log.info(f"Chase Done | Delta: {delta:.5f}")
             try: 
@@ -291,16 +296,12 @@ def limit_chaser(api, target_qty):
             except: pass
             break
             
-        # 2. FORCE CLEANUP
         try:
             c_resp = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
-            # Only log this if verbose, otherwise it's just noise. Keeping minimal.
-            # log.info(f"Chase {i+1} Clean", extra={"api_response": c_resp}) 
             time.sleep(0.5)
         except Exception as e:
             log.error(f"Clean fail: {e}")
 
-        # 3. New Order
         side = "buy" if delta > 0 else "sell"
         size = round(abs(delta), 4)
         limit_px = 0
@@ -316,7 +317,6 @@ def limit_chaser(api, target_qty):
             time.sleep(5)
             continue
             
-        # 4. Place
         try:
             payload = {"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": size, "limitPrice": limit_px, "postOnly": True}
             resp = api.send_order(payload)
@@ -369,7 +369,6 @@ def run_cycle(api):
         accts = api.get_accounts()
         total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
         strat_cap = total_pv * CAP_SPLIT
-        # Minimal log
         log.info(f"PV: ${total_pv:.0f} | Cap: ${strat_cap:.0f}")
         state["portfolio"]["total_equity"] = total_pv
         state["portfolio"]["strat_cap"] = strat_cap
@@ -394,7 +393,6 @@ def run_cycle(api):
     lev_total = norm_planner + norm_tumbler + norm_gainer
     target_qty = lev_total * strat_cap / curr_price
     
-    # Execution
     limit_chaser(api, target_qty)
     
     final_pos = get_net_position(api)
@@ -470,6 +468,8 @@ HTML_TEMPLATE = """
             try {
                 const res = await fetch('/api/state');
                 const d = await res.json();
+                
+                // Metrics
                 document.getElementById('total-equity').innerText = '$' + d.portfolio.total_equity.toFixed(2);
                 document.getElementById('strat-cap').innerText = '$' + d.portfolio.strat_cap.toFixed(2);
                 document.getElementById('current-pos').innerText = d.position.current.toFixed(4);
@@ -485,8 +485,45 @@ HTML_TEMPLATE = """
                 colorize(d.strategies.gainer.fair_lev, 'lev-gainer');
                 document.getElementById('raw-gainer').innerText = d.strategies.gainer.raw_lev.toFixed(2);
                 
-                // Directly inject HTML for expandable details
-                document.getElementById('log-container').innerHTML = d.logs.slice().reverse().map(l => `<div class="log-entry">${l}</div>`).join('');
+                // NO-FLICKER LOG LOGIC
+                // We sync the DOM instead of replacing it.
+                const logContainer = document.getElementById('log-container');
+                const newLogs = d.logs.slice().reverse(); // Newest first
+                const newIds = new Set(newLogs.map(l => l.id));
+
+                // 1. Remove old
+                Array.from(logContainer.children).forEach(child => {
+                    if (!newIds.has(child.dataset.id)) child.remove();
+                });
+
+                // 2. Insert/Update
+                newLogs.forEach((log, index) => {
+                    let existing = logContainer.querySelector(`[data-id="${log.id}"]`);
+                    if (!existing) {
+                        const div = document.createElement('div');
+                        div.className = 'log-entry';
+                        div.dataset.id = log.id;
+                        div.innerHTML = log.html;
+                        
+                        if (index === 0) {
+                            logContainer.prepend(div);
+                        } else {
+                            // Find prev element (which is index-1)
+                            const prevId = newLogs[index - 1].id;
+                            const prevEl = logContainer.querySelector(`[data-id="${prevId}"]`);
+                            if (prevEl) prevEl.after(div);
+                            else logContainer.appendChild(div);
+                        }
+                    } else {
+                        // Ensure order (simple check)
+                        const currentAtIndex = logContainer.children[index];
+                        if (currentAtIndex !== existing) {
+                            if (index === 0) logContainer.prepend(existing);
+                            else logContainer.children[index - 1].after(existing);
+                        }
+                    }
+                });
+
             } catch(e) {}
         }
         setInterval(update, 2000); update();
