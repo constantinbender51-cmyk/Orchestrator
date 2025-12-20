@@ -3,10 +3,10 @@
 master_trader.py - Unified Orchestrator for Planner, Tumbler, and Gainer
 Target: FF_XBTUSD_260130 (Fixed Jan 2030)
 Features:
-- Slow Logging: 0.1s pause after every log to protect console.
-- Position-Aware Limit Chaser.
+- Position-Aware Limit Chaser with full status logging (Cancel + Place).
+- 0.1s Slow Logging to protect Railway console.
 - "Fair 2.0" Strategy Normalization.
-- Concise Status Logging.
+- Concise Status Reporting.
 """
 
 import json
@@ -30,7 +30,7 @@ class SlowStreamHandler(logging.StreamHandler):
             stream = self.stream
             stream.write(msg + self.terminator)
             self.flush()
-            time.sleep(0.1)  # The requested 0.1s pause
+            time.sleep(0.1) 
         except Exception:
             self.handleError(record)
 
@@ -232,7 +232,9 @@ def limit_chaser(api, target_qty):
         if abs(delta) < MIN_TRADE_SIZE:
             log.info(f"Chaser Complete: Target reached (Pos: {curr_pos:.4f})")
             if order_id:
-                try: api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
+                try: 
+                    c_resp = api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
+                    log.info(f"Cleanup Cancel: {c_resp.get('result')} | {c_resp.get('cancelStatus', {}).get('status')}")
                 except: pass
             break
             
@@ -254,14 +256,19 @@ def limit_chaser(api, target_qty):
             
         try:
             if order_id:
-                api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
+                # Log Cancel Status
+                c_resp = api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
+                c_res = c_resp.get("result", "unknown")
+                c_stat = c_resp.get("cancelStatus", {}).get("status", "unknown")
+                log.info(f"Chase Step {i+1} Cancel: {c_res} | {c_stat}")
             
+            # Log Place Status
             payload = {"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": size, "limitPrice": limit_px, "postOnly": True}
             resp = api.send_order(payload)
             
             result_str = resp.get("result", "unknown")
             status_str = resp.get("sendStatus", {}).get("status", "unknown")
-            log.info(f"Order {i+1} [{side} {size} @ {limit_px}]: {result_str} | {status_str}")
+            log.info(f"Chase Step {i+1} Place [{side} {size} @ {limit_px}]: {result_str} | {status_str}")
             
             if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                 order_id = resp["sendStatus"]["order_id"]
