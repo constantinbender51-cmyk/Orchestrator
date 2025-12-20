@@ -6,7 +6,7 @@ Features:
 - Position-Aware Limit Chaser (Fixed: Uses Cancel-All to prevent stacking).
 - Built-in Web Server (Port 8080) for Real-Time Monitoring.
 - Runs on Railway (Single Process).
-- Atomic State Persistence.
+- Minimalistic Logging with Expandable API Responses in Dashboard.
 """
 
 import json
@@ -46,10 +46,22 @@ PORT = int(os.getenv("PORT", 8080))
 LOG_BUFFER = collections.deque(maxlen=200) # Keep last 200 logs for dashboard
 
 class BufferHandler(logging.Handler):
-    """Stores logs in memory for the dashboard."""
+    """Stores logs in memory for the dashboard with HTML formatted details."""
     def emit(self, record):
         try:
             msg = self.format(record)
+            # Check for extra 'api_response' context
+            if hasattr(record, 'api_response'):
+                try:
+                    json_str = json.dumps(record.api_response, indent=2)
+                    # Append HTML details block
+                    msg += (
+                        f"<details style='margin:5px 0 10px 0; border-left:2px solid #30363d; padding-left:10px;'>"
+                        f"<summary style='cursor:pointer; color:#58a6ff; font-size:0.85em; outline:none;'>API Response</summary>"
+                        f"<pre style='margin:5px 0 0 0; font-size:0.8em; color:#8b949e; overflow-x:auto; background:#0d1117; padding:5px; border-radius:4px;'>{json_str}</pre>"
+                        f"</details>"
+                    )
+                except: pass
             LOG_BUFFER.append(msg)
         except Exception:
             self.handleError(record)
@@ -61,13 +73,14 @@ class SlowStreamHandler(logging.StreamHandler):
             msg = self.format(record)
             self.stream.write(msg + self.terminator)
             self.flush()
-            time.sleep(0.1)
+            time.sleep(0.05) # Slightly faster but safe
         except Exception:
             self.handleError(record)
 
 log = logging.getLogger("MASTER")
 log.setLevel(logging.INFO)
-fmt = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
+# Minimal Time Format: [05:44]
+fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M")
 
 # Add Handlers
 slow_h = SlowStreamHandler(sys.stdout)
@@ -126,7 +139,6 @@ def save_state_rich(state, logs_deque):
         state["market"]["last_updated"] = datetime.now(timezone.utc).isoformat()
         clean_state = {k: v for k, v in state.items() if k != "df_1d"}
         
-        # Atomic Write
         temp_file = STATE_FILE.with_suffix(".tmp")
         with open(temp_file, "w") as f:
             json.dump(clean_state, f, indent=2)
@@ -145,7 +157,7 @@ def get_market_price(api):
         for t in resp.get("tickers", []):
             if t.get("symbol") == SYMBOL_FUTS: 
                 return float(t.get("markPrice"))
-    except Exception as e: log.error(f"Ticker fetch failed: {e}")
+    except Exception as e: log.error(f"Ticker fail: {e}")
     return 0.0
 
 def get_net_position(api):
@@ -155,7 +167,7 @@ def get_net_position(api):
             if p.get('symbol') == SYMBOL_FUTS:
                 size = float(p.get('size', 0.0))
                 return size if p.get('side') == 'long' else -size
-    except Exception as e: log.error(f"Pos fetch failed: {e}")
+    except Exception as e: log.error(f"Pos fail: {e}")
     return 0.0
 
 # --- Strategy Modules ---
@@ -166,7 +178,7 @@ def run_planner(df_1d, state, capital):
     if s["peak_equity"] > 0:
         dd = (s["peak_equity"] - capital) / s["peak_equity"]
         if dd > PLANNER_PARAMS["S1_STOP"]: 
-            if not s["stopped"]: log.info(f"Planner S1 Soft Stop Triggered (DD: {dd*100:.2f}%)")
+            if not s["stopped"]: log.info(f"Plan Stop | DD: {dd*100:.2f}%")
             s["stopped"] = True
     else: s["peak_equity"] = capital
 
@@ -207,7 +219,7 @@ def run_tumbler(df_1d, state, capital):
     s["last_iii"] = float(iii)
     
     if iii < TUMBLER_PARAMS["FLAT_THRESH"]:
-        if not s["flat_regime"]: log.info(f"Tumbler: Entering Flat Regime (III={iii:.4f})")
+        if not s["flat_regime"]: log.info(f"Tumb Flat | III={iii:.4f}")
         s["flat_regime"] = True
     
     if s["flat_regime"]:
@@ -216,7 +228,7 @@ def run_tumbler(df_1d, state, capital):
         curr = df_1d['close'].iloc[-1]
         b = TUMBLER_PARAMS["BAND"]
         if abs(curr - sma1) <= sma1*b or abs(curr - sma2) <= sma2*b:
-             log.info("Tumbler: Releasing Flat Regime")
+             log.info("Tumb Release")
              s["flat_regime"] = False
     
     if s["flat_regime"]: return 0.0
@@ -260,9 +272,9 @@ def run_gainer(df_1h, df_1d):
 
 def limit_chaser(api, target_qty):
     if dry: return
-    log.info(f"Starting Limit Chaser. Target: {target_qty:.4f}")
+    log.info(f"Chase Start | Tgt: {target_qty:.4f}")
     
-    # Pre-emptive clear (Good practice before starting the chase)
+    # Pre-emptive clear
     try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
     except: pass
     
@@ -270,25 +282,25 @@ def limit_chaser(api, target_qty):
         curr_pos = get_net_position(api)
         delta = target_qty - curr_pos
         
-        # 1. Check if done
+        # 1. Done?
         if abs(delta) < MIN_TRADE_SIZE:
-            log.info(f"Chaser Complete: Target reached.")
+            log.info(f"Chase Done | Delta: {delta:.5f}")
             try: 
                 c_resp = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
-                log.info(f"Cleanup: {c_resp.get('result')}")
+                log.info(f"Cleanup | {c_resp.get('result')}", extra={"api_response": c_resp})
             except: pass
             break
             
-        # 2. FORCE CLEANUP: Cancel ALL orders before placing new one
-        # This prevents "stacking" if order_id tracking fails.
+        # 2. FORCE CLEANUP
         try:
             c_resp = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
-            log.info(f"Chase {i+1} Clean: {c_resp.get('result')}")
-            time.sleep(0.5) # Wait for propagation
+            # Only log this if verbose, otherwise it's just noise. Keeping minimal.
+            # log.info(f"Chase {i+1} Clean", extra={"api_response": c_resp}) 
+            time.sleep(0.5)
         except Exception as e:
-            log.error(f"Clean failed: {e}")
+            log.error(f"Clean fail: {e}")
 
-        # 3. Prepare New Order
+        # 3. New Order
         side = "buy" if delta > 0 else "sell"
         size = round(abs(delta), 4)
         limit_px = 0
@@ -300,21 +312,20 @@ def limit_chaser(api, target_qty):
                     limit_px += (-LIMIT_OFFSET_TICKS if side == "buy" else LIMIT_OFFSET_TICKS)
                     break
         except Exception as e:
-            log.error(f"Ticker fetch failed: {e}")
+            log.error(f"Ticker fail: {e}")
             time.sleep(5)
             continue
             
-        # 4. Place New Order
+        # 4. Place
         try:
             payload = {"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": size, "limitPrice": limit_px, "postOnly": True}
             resp = api.send_order(payload)
-            log.info(f"Chase {i+1} Place [{side} {size} @ {limit_px}]: {resp.get('result')}")
+            log.info(f"Chase {i+1} | {side.upper()} {size} @ {limit_px} | {resp.get('result')}", extra={"api_response": resp})
         except Exception as e:
-            log.error(f"Chaser Execution Error: {e}")
+            log.error(f"Exec Error: {e}")
             
         time.sleep(CHASE_INTERVAL)
     
-    # Final cleanup (just in case loop ends without break)
     try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
     except: pass
 
@@ -331,22 +342,22 @@ def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
     stop_px_p = int(price * (1 - PLANNER_PARAMS["S1_STOP"])) if side == "sell" else int(price * (1 + PLANNER_PARAMS["S1_STOP"]))
     try:
         resp = api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty, "stopPrice": stop_px_p, "reduceOnly": True})
-        log.info(f"Planner Stop: {resp.get('result')}")
+        log.info(f"Stop Plan | {resp.get('result')}", extra={"api_response": resp})
     except: pass
 
     stop_px_t = int(price * (1 - TUMBLER_PARAMS["STOP"])) if side == "sell" else int(price * (1 + TUMBLER_PARAMS["STOP"]))
     try:
         resp = api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty, "stopPrice": stop_px_t, "reduceOnly": True})
-        log.info(f"Tumbler Stop: {resp.get('result')}")
+        log.info(f"Stop Tumb | {resp.get('result')}", extra={"api_response": resp})
     except: pass
 
 def run_cycle(api):
-    log.info(">>> CYCLE START <<<")
+    log.info("--- CYCLE ---")
     try:
         df_1h = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 60)
         df_1d = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 1440)
     except Exception as e:
-        log.error(f"Failed to fetch OHLC: {e}")
+        log.error(f"OHLC fail: {e}")
         return
 
     state = load_state()
@@ -358,7 +369,8 @@ def run_cycle(api):
         accts = api.get_accounts()
         total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
         strat_cap = total_pv * CAP_SPLIT
-        log.info(f"Total PV: ${total_pv:.2f} | StratAlloc: ${strat_cap:.2f}")
+        # Minimal log
+        log.info(f"PV: ${total_pv:.0f} | Cap: ${strat_cap:.0f}")
         state["portfolio"]["total_equity"] = total_pv
         state["portfolio"]["strat_cap"] = strat_cap
     except: return
@@ -373,12 +385,11 @@ def run_cycle(api):
     norm_tumbler = raw_tumbler * (TARGET_STRAT_LEV / TUMBLER_MAX_LEV)
     norm_gainer  = raw_gainer  * TARGET_STRAT_LEV
     
-    # State Update
     state["strategies"]["planner"].update({"raw_lev": raw_planner, "fair_lev": norm_planner})
     state["strategies"]["tumbler"].update({"raw_lev": raw_tumbler, "fair_lev": norm_tumbler})
     state["strategies"]["gainer"].update({"raw_lev": raw_gainer, "fair_lev": norm_gainer})
 
-    log.info(f"Fair Levs | Plan: {norm_planner:.2f} | Tumb: {norm_tumbler:.2f} | Gain: {norm_gainer:.2f}")
+    log.info(f"Levs | P:{norm_planner:.2f} T:{norm_tumbler:.2f} G:{norm_gainer:.2f}")
 
     lev_total = norm_planner + norm_tumbler + norm_gainer
     target_qty = lev_total * strat_cap / curr_price
@@ -391,13 +402,13 @@ def run_cycle(api):
     
     manage_virtual_stops(api, state, final_pos, curr_price, strat_cap)
     save_state_rich(state, LOG_BUFFER)
-    log.info(">>> CYCLE END <<<")
+    log.info("--- END ---")
 
 def wait_until_next_hour():
     now = datetime.now(timezone.utc)
     next_run = (now + timedelta(hours=1)).replace(minute=1, second=0, microsecond=0)
     wait = (next_run - now).total_seconds()
-    log.info(f"Sleeping until {next_run.strftime('%H:%M')} ({wait/60:.1f}m)")
+    log.info(f"Sleep -> {next_run.strftime('%H:%M')} ({wait/60:.0f}m)")
     time.sleep(wait)
 
 # --- WEB SERVER (DASHBOARD) ---
@@ -408,7 +419,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Master Trader Observation</title>
+    <title>Master Trader</title>
     <style>
         :root { --bg-dark: #0d1117; --bg-card: #161b22; --border: #30363d; --text-main: #c9d1d9; --text-muted: #8b949e; --accent: #58a6ff; --success: #238636; --danger: #da3633; }
         body { background-color: var(--bg-dark); color: var(--text-main); font-family: 'Segoe UI', monospace; margin: 0; padding: 20px; }
@@ -425,8 +436,8 @@ HTML_TEMPLATE = """
         .strat-val { font-size: 1.5em; font-weight: bold; }
         .pos { color: #3fb950; }
         .neg { color: #f85149; }
-        .log-window { background: #000; border: 1px solid var(--border); height: 300px; overflow-y: scroll; padding: 10px; font-family: 'Consolas', monospace; font-size: 0.85em; color: #a5d6ff; margin-top: 20px; }
-        .log-entry { margin-bottom: 4px; border-bottom: 1px solid #1f1f1f; }
+        .log-window { background: #000; border: 1px solid var(--border); height: 350px; overflow-y: scroll; padding: 10px; font-family: 'Consolas', monospace; font-size: 0.85em; color: #a5d6ff; margin-top: 20px; }
+        .log-entry { margin-bottom: 4px; border-bottom: 1px solid #1f1f1f; padding-bottom: 2px; }
     </style>
 </head>
 <body>
@@ -474,6 +485,7 @@ HTML_TEMPLATE = """
                 colorize(d.strategies.gainer.fair_lev, 'lev-gainer');
                 document.getElementById('raw-gainer').innerText = d.strategies.gainer.raw_lev.toFixed(2);
                 
+                // Directly inject HTML for expandable details
                 document.getElementById('log-container').innerHTML = d.logs.slice().reverse().map(l => `<div class="log-entry">${l}</div>`).join('');
             } catch(e) {}
         }
@@ -515,7 +527,6 @@ def main():
     if not api_key: sys.exit("No API Keys")
     api = kf.KrakenFuturesApi(api_key, api_sec)
     
-    # Start Dashboard in Background Thread
     t = threading.Thread(target=start_server, daemon=True)
     t.start()
     
