@@ -3,7 +3,7 @@
 master_trader.py - Unified Trading Engine & Observation Deck
 Features:
 - "Fair 2.0" Strategy Normalization.
-- Position-Aware Limit Chaser.
+- Position-Aware Limit Chaser (Fixed: Uses Cancel-All to prevent stacking).
 - Built-in Web Server (Port 8080) for Real-Time Monitoring.
 - Runs on Railway (Single Process).
 - Atomic State Persistence.
@@ -261,21 +261,34 @@ def run_gainer(df_1h, df_1d):
 def limit_chaser(api, target_qty):
     if dry: return
     log.info(f"Starting Limit Chaser. Target: {target_qty:.4f}")
-    order_id = None
+    
+    # Pre-emptive clear (Good practice before starting the chase)
+    try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+    except: pass
     
     for i in range(int(LIMIT_CHASE_DURATION / CHASE_INTERVAL)):
         curr_pos = get_net_position(api)
         delta = target_qty - curr_pos
         
+        # 1. Check if done
         if abs(delta) < MIN_TRADE_SIZE:
             log.info(f"Chaser Complete: Target reached.")
-            if order_id:
-                try: 
-                    c_resp = api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
-                    log.info(f"Cleanup Cancel: {c_resp.get('result')}")
-                except: pass
+            try: 
+                c_resp = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+                log.info(f"Cleanup: {c_resp.get('result')}")
+            except: pass
             break
             
+        # 2. FORCE CLEANUP: Cancel ALL orders before placing new one
+        # This prevents "stacking" if order_id tracking fails.
+        try:
+            c_resp = api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+            log.info(f"Chase {i+1} Clean: {c_resp.get('result')}")
+            time.sleep(0.5) # Wait for propagation
+        except Exception as e:
+            log.error(f"Clean failed: {e}")
+
+        # 3. Prepare New Order
         side = "buy" if delta > 0 else "sell"
         size = round(abs(delta), 4)
         limit_px = 0
@@ -291,19 +304,17 @@ def limit_chaser(api, target_qty):
             time.sleep(5)
             continue
             
+        # 4. Place New Order
         try:
-            if order_id:
-                c_resp = api.cancel_order({"orderId": order_id, "symbol": SYMBOL_FUTS})
-                log.info(f"Chase {i+1} Cancel: {c_resp.get('result')}")
-            
             payload = {"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": size, "limitPrice": limit_px, "postOnly": True}
             resp = api.send_order(payload)
             log.info(f"Chase {i+1} Place [{side} {size} @ {limit_px}]: {resp.get('result')}")
-            if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
-                order_id = resp["sendStatus"]["order_id"]
         except Exception as e:
             log.error(f"Chaser Execution Error: {e}")
+            
         time.sleep(CHASE_INTERVAL)
+    
+    # Final cleanup (just in case loop ends without break)
     try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
     except: pass
 
