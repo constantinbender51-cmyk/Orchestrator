@@ -3,12 +3,10 @@
 master_trader.py - Unified Orchestrator for Planner, Tumbler, and Gainer
 Target: FF_XBTUSD_260130 (Fixed Jan 2030)
 Features:
+- Slow Logging: 0.1s pause after every log to protect console.
 - Position-Aware Limit Chaser.
+- "Fair 2.0" Strategy Normalization.
 - Concise Status Logging.
-- "Fair 2.0" Strategy Normalization:
-  - Planner: Max 2.0x (Preserved for Stop Logic).
-  - Tumbler: Scaled to Max 2.0x (from ~4.3x).
-  - Gainer: Scaled to Max 2.0x (from 1.0x).
 """
 
 import json
@@ -22,6 +20,19 @@ import numpy as np
 import pandas as pd
 import kraken_futures as kf
 import kraken_ohlc
+
+# --- Custom Slow Logging Handler ---
+class SlowStreamHandler(logging.StreamHandler):
+    """Pauses for 0.1s after every log message to prevent console flooding."""
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            stream.write(msg + self.terminator)
+            self.flush()
+            time.sleep(0.1)  # The requested 0.1s pause
+        except Exception:
+            self.handleError(record)
 
 # --- Global Configuration ---
 SYMBOL_FUTS = "FF_XBTUSD_260130"
@@ -38,15 +49,14 @@ LIMIT_OFFSET_TICKS = 1      # Start 1 tick away from spread
 TUMBLER_MAX_LEV = 4.327
 TARGET_STRAT_LEV = 2.0
 
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+# Setup Logging
 log = logging.getLogger("MASTER")
-dry = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
+log.setLevel(logging.INFO)
+slow_handler = SlowStreamHandler(sys.stdout)
+slow_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
+log.addHandler(slow_handler)
 
+dry = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 STATE_FILE = Path("master_state.json")
 
 # --- Strategy Parameters ---
@@ -119,9 +129,6 @@ def get_net_position(api):
 
 # --- Strategy Modules ---
 def run_planner(df_1d, state, capital):
-    """
-    Max Leverage: 2.0 (Native)
-    """
     s = state["planner"]
     if s["peak_equity"] < capital: s["peak_equity"] = capital
     if s["peak_equity"] > 0:
@@ -154,9 +161,6 @@ def run_planner(df_1d, state, capital):
     return max(-2.0, min(2.0, s1_lev + s2_lev))
 
 def run_tumbler(df_1d, state, capital):
-    """
-    Max Leverage: 4.327 (Native) -> Will be normalized in run_cycle
-    """
     s = state["tumbler"]
     w = TUMBLER_PARAMS["III_WIN"]
     if len(df_1d) < w+1: return 0.0
@@ -188,9 +192,6 @@ def run_tumbler(df_1d, state, capital):
     return 0.0
 
 def run_gainer(df_1h, df_1d):
-    """
-    Max Leverage: 1.0 (Native) -> Will be normalized in run_cycle
-    """
     def calc_macd(prices, params, weights):
         comp = 0.0
         for (f,s,sig), w in zip(params, weights):
@@ -220,9 +221,6 @@ def run_gainer(df_1h, df_1d):
 # --- Execution Engine ---
 
 def limit_chaser(api, target_qty):
-    """
-    Position-Aware Limit Chaser.
-    """
     if dry: return
     log.info(f"Starting Limit Chaser. Target Net Position: {target_qty:.4f}")
     order_id = None
@@ -261,7 +259,6 @@ def limit_chaser(api, target_qty):
             payload = {"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": size, "limitPrice": limit_px, "postOnly": True}
             resp = api.send_order(payload)
             
-            # Concise Logging
             result_str = resp.get("result", "unknown")
             status_str = resp.get("sendStatus", {}).get("status", "unknown")
             log.info(f"Order {i+1} [{side} {size} @ {limit_px}]: {result_str} | {status_str}")
@@ -277,9 +274,6 @@ def limit_chaser(api, target_qty):
     except: pass
 
 def manage_virtual_stops(api, state, net_size, price, cap_per_strat):
-    """
-    Places stops with concise logging.
-    """
     net_size = round(net_size, 4)
     if dry or abs(net_size) < MIN_TRADE_SIZE: return
     try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
@@ -308,7 +302,10 @@ def run_cycle(api):
     try:
         df_1h = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 60)
         df_1d = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 1440)
-    except: return
+    except Exception as e:
+        log.error(f"Failed to fetch OHLC data: {e}")
+        return
+
     state = load_state()
     state["df_1d"] = df_1d 
     curr_price = get_market_price(api) or df_1h['close'].iloc[-1]
@@ -320,15 +317,13 @@ def run_cycle(api):
         log.info(f"Total PV: ${total_pv:.2f} | StratAlloc: ${strat_cap:.2f}")
     except: return
     
-    # 1. Raw Signals
     raw_planner = run_planner(df_1d, state, strat_cap)
     raw_tumbler = run_tumbler(df_1d, state, strat_cap)
     raw_gainer = run_gainer(df_1h, df_1d)
     
-    # 2. Fairness Normalization (Target Max 2.0x per Strat)
-    norm_planner = raw_planner # Already Max 2.0
-    norm_tumbler = raw_tumbler * (TARGET_STRAT_LEV / TUMBLER_MAX_LEV) # 4.3 -> 2.0
-    norm_gainer  = raw_gainer  * TARGET_STRAT_LEV # 1.0 -> 2.0
+    norm_planner = raw_planner
+    norm_tumbler = raw_tumbler * (TARGET_STRAT_LEV / TUMBLER_MAX_LEV)
+    norm_gainer  = raw_gainer  * TARGET_STRAT_LEV
     
     log.info(f"Raw Levs  | Plan: {raw_planner:.2f} | Tumb: {raw_tumbler:.2f} | Gain: {raw_gainer:.2f}")
     log.info(f"Fair Levs | Plan: {norm_planner:.2f} | Tumb: {norm_tumbler:.2f} | Gain: {norm_gainer:.2f}")
@@ -336,7 +331,6 @@ def run_cycle(api):
     lev_total = norm_planner + norm_tumbler + norm_gainer
     target_qty = lev_total * strat_cap / curr_price
     
-    # 3. Execution
     limit_chaser(api, target_qty)
     
     final_pos = get_net_position(api)
@@ -347,13 +341,18 @@ def run_cycle(api):
 def wait_until_next_hour():
     now = datetime.now(timezone.utc)
     next_run = (now + timedelta(hours=1)).replace(minute=1, second=0, microsecond=0)
-    time.sleep((next_run - now).total_seconds())
+    wait = (next_run - now).total_seconds()
+    log.info(f"Sleeping until {next_run.strftime('%H:%M')} ({wait/60:.1f}m)")
+    time.sleep(wait)
 
 def main():
     api_key, api_sec = os.getenv("KRAKEN_API_KEY"), os.getenv("KRAKEN_API_SECRET")
     if not api_key: sys.exit("No API Keys")
     api = kf.KrakenFuturesApi(api_key, api_sec)
-    if os.getenv("RUN_TRADE_NOW", "false").lower() in {"1", "true", "yes"}: run_cycle(api)
+    
+    if os.getenv("RUN_TRADE_NOW", "false").lower() in {"1", "true", "yes"}:
+        run_cycle(api)
+        
     while True:
         wait_until_next_hour()
         run_cycle(api)
