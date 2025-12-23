@@ -22,7 +22,8 @@ import kraken_futures as kf
 import kraken_ohlc
 
 # --- Global Configuration ---
-SYMBOL_FUTS = "FF_XBTUSD_260130"
+# Changed to Perpetual Contract as requested
+SYMBOL_FUTS = "PF_XBTUSD"
 SYMBOL_OHLC = "XBTUSD"
 CAP_SPLIT = 0.333
 LIMIT_CHASE_DURATION = 720
