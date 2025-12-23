@@ -7,6 +7,7 @@ Features:
 - Minimalistic Logging with [HH:MM] timestamps.
 - Slow-Log Protection (0.1s pause) for Railway console.
 - Atomic State Management for strategy persistence.
+- Full Gainer Ensemble (MACD 1H/1D + SMA 1D) matching Analysis.
 """
 
 import json
@@ -62,7 +63,24 @@ dry = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 # --- Strategy Parameters ---
 PLANNER_PARAMS = {"S1_SMA": 120, "S1_DECAY": 40, "S1_STOP": 0.13, "S2_SMA": 400}
 TUMBLER_PARAMS = {"SMA1": 32, "SMA2": 114, "STOP": 0.043, "III_WIN": 27, "FLAT_THRESH": 0.356, "BAND": 0.077, "LEVS": [0.079, 4.327, 3.868], "III_TH": [0.058, 0.259]}
-GAINER_PARAMS = {"WEIGHTS": [0.8, 0.4], "MACD_1H": {'params': [(97, 366, 47)]}, "MACD_1D": {'params': [(52, 64, 61)]}}
+
+# Updated GAINER_PARAMS to match binance_analysis.py exactly
+# External GA Weights: [0.8, 0, 0.4, 0, 0, 0.4] -> MACD_1H: 0.8, MACD_1D: 0.4, SMA_1D: 0.4
+GAINER_PARAMS = {
+    "GA_WEIGHTS": {"MACD_1H": 0.8, "MACD_1D": 0.4, "SMA_1D": 0.4},
+    "MACD_1H": {
+        'params': [(97, 366, 47), (15, 40, 11), (16, 55, 13)], 
+        'weights': [0.45, 0.43, 0.01]
+    },
+    "MACD_1D": {
+        'params': [(52, 64, 61), (5, 6, 4), (17, 18, 16)], 
+        'weights': [0.87, 0.92, 0.73]
+    },
+    "SMA_1D": {
+        'params': [40, 120, 390], 
+        'weights': [0.6, 0.8, 0.4]
+    }
+}
 
 # --- State Management ---
 def load_state():
@@ -150,14 +168,57 @@ def run_tumbler(df_1d, state, capital):
     return lev if (curr > sma1 and curr > sma2) else (-lev if (curr < sma1 and curr < sma2) else 0.0)
 
 def run_gainer(df_1h, df_1d):
-    def macd_val(prices, p):
-        f, s, sig = p[0]
-        fast, slow = prices.ewm(span=f).mean(), prices.ewm(span=s).mean()
-        macd = fast - slow
-        return 1.0 if macd.iloc[-1] > macd.ewm(span=sig).mean().iloc[-1] else -1.0
-    s1 = macd_val(df_1h['close'], GAINER_PARAMS["MACD_1H"]['params']) * GAINER_PARAMS["WEIGHTS"][0]
-    s3 = macd_val(df_1d['close'], GAINER_PARAMS["MACD_1D"]['params']) * GAINER_PARAMS["WEIGHTS"][1]
-    return (s1 + s3) / sum(GAINER_PARAMS["WEIGHTS"])
+    """
+    Implements the exact logic from binance_analysis.py with 3-tuple parameter sets
+    and specific GA weights: MACD_1H (0.8), MACD_1D (0.4), SMA_1D (0.4).
+    """
+    def calc_macd_pos(prices, config):
+        params = config['params']
+        weights = config['weights']
+        composite = 0.0
+        # Iterate over the 3 parameter sets (e.g., 97/366/47, etc.)
+        for (f, s, sig_p), w in zip(params, weights):
+            # Using adjust=False to match binance_analysis.py logic
+            fast = prices.ewm(span=f, adjust=False).mean()
+            slow = prices.ewm(span=s, adjust=False).mean()
+            macd = fast - slow
+            sig_line = macd.ewm(span=sig_p, adjust=False).mean()
+            val = 1.0 if macd.iloc[-1] > sig_line.iloc[-1] else -1.0
+            composite += val * w
+        
+        total_w = sum(weights)
+        return composite / total_w if total_w > 0 else composite
+
+    def calc_sma_pos(prices, config):
+        params = config['params']
+        weights = config['weights']
+        composite = 0.0
+        current_price = prices.iloc[-1]
+        # Iterate over the 3 SMA windows
+        for p, w in zip(params, weights):
+            sma_val = get_sma(prices, p)
+            val = 1.0 if current_price > sma_val else -1.0
+            composite += val * w
+            
+        total_w = sum(weights)
+        return composite / total_w if total_w > 0 else composite
+
+    # 1. MACD 1H (GA Weight: 0.8)
+    macd_1h_raw = calc_macd_pos(df_1h['close'], GAINER_PARAMS["MACD_1H"])
+    s_macd_1h = macd_1h_raw * GAINER_PARAMS["GA_WEIGHTS"]["MACD_1H"]
+
+    # 2. MACD 1D (GA Weight: 0.4)
+    macd_1d_raw = calc_macd_pos(df_1d['close'], GAINER_PARAMS["MACD_1D"])
+    s_macd_1d = macd_1d_raw * GAINER_PARAMS["GA_WEIGHTS"]["MACD_1D"]
+
+    # 3. SMA 1D (GA Weight: 0.4)
+    sma_1d_raw = calc_sma_pos(df_1d['close'], GAINER_PARAMS["SMA_1D"])
+    s_sma_1d = sma_1d_raw * GAINER_PARAMS["GA_WEIGHTS"]["SMA_1D"]
+
+    # Normalize by sum of GA weights (0.8 + 0.4 + 0.4 = 1.6)
+    total_ga_weight = sum(GAINER_PARAMS["GA_WEIGHTS"].values())
+    
+    return (s_macd_1h + s_macd_1d + s_sma_1d) / total_ga_weight
 
 # --- Execution ---
 def limit_chaser(api, target_qty):
