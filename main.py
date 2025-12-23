@@ -8,6 +8,7 @@ Features:
 - Slow-Log Protection (0.1s pause) for Railway console.
 - Atomic State Management for strategy persistence.
 - Full Gainer Ensemble (MACD 1H/1D + SMA 1D) matching Analysis.
+- Tumbler Corrected: SMA1/SMA2 Release + 12.6% Take Profit.
 """
 
 import json
@@ -62,7 +63,13 @@ dry = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 
 # --- Strategy Parameters ---
 PLANNER_PARAMS = {"S1_SMA": 120, "S1_DECAY": 40, "S1_STOP": 0.13, "S2_SMA": 400}
-TUMBLER_PARAMS = {"SMA1": 32, "SMA2": 114, "STOP": 0.043, "III_WIN": 27, "FLAT_THRESH": 0.356, "BAND": 0.077, "LEVS": [0.079, 4.327, 3.868], "III_TH": [0.058, 0.259]}
+# Added TAKE_PROFIT to Tumbler Params
+TUMBLER_PARAMS = {
+    "SMA1": 32, "SMA2": 114, 
+    "STOP": 0.043, "TAKE_PROFIT": 0.126, 
+    "III_WIN": 27, "FLAT_THRESH": 0.356, "BAND": 0.077, 
+    "LEVS": [0.079, 4.327, 3.868], "III_TH": [0.058, 0.259]
+}
 
 # Updated GAINER_PARAMS to match binance_analysis.py exactly
 # External GA Weights: [0.8, 0, 0.4, 0, 0, 0.4] -> MACD_1H: 0.8, MACD_1D: 0.4, SMA_1D: 0.4
@@ -158,11 +165,27 @@ def run_tumbler(df_1d, state, capital):
     lev = TUMBLER_PARAMS["LEVS"][2]
     if iii < TUMBLER_PARAMS["III_TH"][0]: lev = TUMBLER_PARAMS["LEVS"][0]
     elif iii < TUMBLER_PARAMS["III_TH"][1]: lev = TUMBLER_PARAMS["LEVS"][1]
+    
     if iii < TUMBLER_PARAMS["FLAT_THRESH"]: s["flat_regime"] = True
+    
+    # Corrected Flat Regime Release: Check SMA1 OR SMA2
     if s["flat_regime"]:
         sma1 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA1"])
-        if abs(df_1d['close'].iloc[-1] - sma1) <= sma1 * TUMBLER_PARAMS["BAND"]: s["flat_regime"] = False
+        sma2 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA2"])
+        curr = df_1d['close'].iloc[-1]
+        
+        band1 = sma1 * TUMBLER_PARAMS["BAND"]
+        band2 = sma2 * TUMBLER_PARAMS["BAND"]
+        
+        # Release if price touches the band of SMA1 OR SMA2
+        on_sma1 = abs(curr - sma1) <= band1
+        on_sma2 = abs(curr - sma2) <= band2
+        
+        if on_sma1 or on_sma2:
+            s["flat_regime"] = False
+            
     if s["flat_regime"]: return 0.0
+    
     sma1, sma2 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA1"]), get_sma(df_1d['close'], TUMBLER_PARAMS["SMA2"])
     curr = df_1d['close'].iloc[-1]
     return lev if (curr > sma1 and curr > sma2) else (-lev if (curr < sma1 and curr < sma2) else 0.0)
@@ -262,15 +285,39 @@ def limit_chaser(api, target_qty):
 
 def manage_stops(api, net_size, price):
     if dry or abs(net_size) < MIN_TRADE_SIZE: return
+    
+    # "Side" here is the ORDER side to close the position.
+    # Long Pos (net > 0) -> Sell Stop / Sell Limit
+    # Short Pos (net < 0) -> Buy Stop / Buy Limit
     side = "sell" if net_size > 0 else "buy"
-    qty = round(abs(net_size) * 0.33, 4)
-    # Planner & Tumbler Stops
-    for stop_pct in [PLANNER_PARAMS["S1_STOP"], TUMBLER_PARAMS["STOP"]]:
-        px = int(price * (1 - stop_pct)) if side == "sell" else int(price * (1 + stop_pct))
-        try:
-            r = api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty, "stopPrice": px, "reduceOnly": True})
-            log.info(f"Stop Placed | Px: {px} | {r.get('result')}")
-        except: pass
+    
+    # Apply Tumbler/Planner logic to partial chunks (heuristic: 1/3 split)
+    qty_part = round(abs(net_size) * 0.333, 4)
+    if qty_part < MIN_TRADE_SIZE: return
+
+    # 1. Planner Stop (13%)
+    p_stop = PLANNER_PARAMS["S1_STOP"]
+    px_p = int(price * (1 - p_stop)) if side == "sell" else int(price * (1 + p_stop))
+    try:
+        api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty_part, "stopPrice": px_p, "reduceOnly": True})
+    except: pass
+
+    # 2. Tumbler Stop (4.3%)
+    t_stop = TUMBLER_PARAMS["STOP"]
+    px_t = int(price * (1 - t_stop)) if side == "sell" else int(price * (1 + t_stop))
+    try:
+        api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty_part, "stopPrice": px_t, "reduceOnly": True})
+    except: pass
+
+    # 3. Tumbler Take Profit (12.6%) - NEW
+    t_tp = TUMBLER_PARAMS["TAKE_PROFIT"]
+    # If Selling to close (Long): Price = Current * (1 + 0.126) -> Higher
+    # If Buying to close (Short): Price = Current * (1 - 0.126) -> Lower
+    px_tp = int(price * (1 + t_tp)) if side == "sell" else int(price * (1 - t_tp))
+    try:
+        r = api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": qty_part, "limitPrice": px_tp, "reduceOnly": True})
+        log.info(f"Tumbler TP Placed | Px: {px_tp} | {r.get('result')}")
+    except: pass
 
 def run_cycle(api):
     log.info("--- CYCLE ---")
