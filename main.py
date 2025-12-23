@@ -9,6 +9,7 @@ Features:
 - Atomic State Management for strategy persistence.
 - Full Gainer Ensemble (MACD 1H/1D + SMA 1D) matching Analysis.
 - Tumbler Corrected: SMA1/SMA2 Release + 12.6% Take Profit.
+- Planner Final: Virtual Equity System for isolated drawdown tracking.
 """
 
 import json
@@ -24,7 +25,6 @@ import kraken_futures as kf
 import kraken_ohlc
 
 # --- Global Configuration ---
-# Changed to Perpetual Contract as requested
 SYMBOL_FUTS = "PF_XBTUSD"
 SYMBOL_OHLC = "XBTUSD"
 CAP_SPLIT = 0.333
@@ -55,15 +55,17 @@ class SlowStreamHandler(logging.StreamHandler):
 log = logging.getLogger("MASTER")
 log.setLevel(logging.INFO)
 slow_h = SlowStreamHandler(sys.stdout)
-# Log format: [HH:MM] Message
 slow_h.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M"))
 log.addHandler(slow_h)
 
 dry = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 
 # --- Strategy Parameters ---
-PLANNER_PARAMS = {"S1_SMA": 120, "S1_DECAY": 40, "S1_STOP": 0.13, "S2_SMA": 400}
-# Added TAKE_PROFIT to Tumbler Params
+PLANNER_PARAMS = {
+    "S1_SMA": 120, "S1_DECAY": 40, "S1_STOP": 0.13, 
+    "S2_SMA": 400, "S2_STOP": 0.27, "S2_PROX": 0.05
+}
+
 TUMBLER_PARAMS = {
     "SMA1": 32, "SMA2": 114, 
     "STOP": 0.043, "TAKE_PROFIT": 0.126, 
@@ -71,8 +73,6 @@ TUMBLER_PARAMS = {
     "LEVS": [0.079, 4.327, 3.868], "III_TH": [0.058, 0.259]
 }
 
-# Updated GAINER_PARAMS to match binance_analysis.py exactly
-# External GA Weights: [0.8, 0, 0.4, 0, 0, 0.4] -> MACD_1H: 0.8, MACD_1D: 0.4, SMA_1D: 0.4
 GAINER_PARAMS = {
     "GA_WEIGHTS": {"MACD_1H": 0.8, "MACD_1D": 0.4, "SMA_1D": 0.4},
     "MACD_1H": {
@@ -92,22 +92,32 @@ GAINER_PARAMS = {
 # --- State Management ---
 def load_state():
     defaults = {
-        "planner": {"entry_date": None, "peak_equity": 0.0, "stopped": False},
+        "planner": {
+            "virtual_equity": 0.0, # 0.0 triggers init to strat_cap
+            "last_price": 0.0,
+            "last_lev": 0.0,
+            "s1": {"entry_date": None, "peak_equity": 0.0, "stopped": False},
+            "s2": {"peak_equity": 0.0, "stopped": False},
+            "debug_levs": [0.0, 0.0] 
+        },
         "tumbler": {"flat_regime": False}
     }
     if STATE_FILE.exists():
         try:
             with open(STATE_FILE, "r") as f:
                 saved = json.load(f)
+                # Deep merge defaults
                 for k, v in defaults.items():
                     if k not in saved: saved[k] = v
+                    elif isinstance(v, dict):
+                        for sub_k, sub_v in v.items():
+                            if sub_k not in saved[k]: saved[k][sub_k] = sub_v
                 return saved
         except Exception as e: log.error(f"State load error: {e}")
     return defaults
 
 def save_state(state):
     try:
-        # Atomic Write
         temp_file = STATE_FILE.with_suffix(".tmp")
         with open(temp_file, "w") as f:
             json.dump(state, f, indent=2)
@@ -137,24 +147,96 @@ def get_net_position(api):
     except: pass
     return 0.0
 
+def calculate_decay(entry_date_str, decay_days):
+    if not entry_date_str: return 1.0
+    entry_dt = datetime.fromisoformat(entry_date_str)
+    if entry_dt.tzinfo is None: entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+    days_since = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 86400
+    if days_since >= decay_days: return 0.0
+    weight = 1.0 - (days_since / decay_days) ** 2
+    return max(0.0, weight)
+
 # --- Strategy Logic ---
+
 def run_planner(df_1d, state, capital):
-    s = state["planner"]
-    if s["peak_equity"] < capital: s["peak_equity"] = capital
+    """
+    Fully implemented Planner with Virtual Equity System.
+    Isolates Planner's PnL from Gainer/Tumbler to prevent cross-contamination of stops.
+    """
+    p_state = state["planner"]
     price = df_1d['close'].iloc[-1]
+    
+    # Init Virtual Equity if fresh or migration
+    if p_state["virtual_equity"] <= 0.0 or p_state["last_price"] <= 0.0:
+        p_state["virtual_equity"] = capital
+        p_state["last_price"] = price
+        p_state["last_lev"] = 0.0
+        # Init peaks if missing
+        if p_state["s1"]["peak_equity"] == 0: p_state["s1"]["peak_equity"] = capital
+        if p_state["s2"]["peak_equity"] == 0: p_state["s2"]["peak_equity"] = capital
+
+    # 1. Update Virtual Equity (The "Isolation Layer")
+    # PnL = %PriceChange * Leverage
+    last_p = p_state["last_price"]
+    last_l = p_state["last_lev"]
+    
+    if last_p > 0:
+        pct_change = (price - last_p) / last_p
+        # If we were Long (lev > 0): Price Up -> Equity Up
+        # If we were Short (lev < 0): Price Up -> Equity Down
+        pnl_pct = pct_change * last_l 
+        p_state["virtual_equity"] *= (1.0 + pnl_pct)
+
+    virt_eq = p_state["virtual_equity"]
+    
+    # 2. Check Stops based on Virtual Equity
+    for key, stop_pct in [("s1", PLANNER_PARAMS["S1_STOP"]), ("s2", PLANNER_PARAMS["S2_STOP"])]:
+        s = p_state[key]
+        if virt_eq > s["peak_equity"]: s["peak_equity"] = virt_eq
+        
+        if s["peak_equity"] > 0:
+            dd = (s["peak_equity"] - virt_eq) / s["peak_equity"]
+            if dd > stop_pct:
+                s["stopped"] = True
+                if key == "s1": s["entry_date"] = None
+
+    # 3. Calculate Signals
     sma120 = get_sma(df_1d['close'], PLANNER_PARAMS["S1_SMA"])
     sma400 = get_sma(df_1d['close'], PLANNER_PARAMS["S2_SMA"])
+
+    # S1 Logic
+    s1 = p_state["s1"]
     s1_lev = 0.0
     if price > sma120:
-        if not s["stopped"]:
-            if not s["entry_date"]: s["entry_date"] = datetime.now(timezone.utc).isoformat()
-            days = (datetime.now(timezone.utc) - datetime.fromisoformat(s["entry_date"]).replace(tzinfo=timezone.utc)).total_seconds() / 86400
-            s1_lev = 1.0 * max(0.0, 1.0 - (days / PLANNER_PARAMS["S1_DECAY"])**2)
+        if not s1["stopped"]:
+            if not s1["entry_date"]: s1["entry_date"] = datetime.now(timezone.utc).isoformat()
+            s1_lev = 1.0 * calculate_decay(s1["entry_date"], PLANNER_PARAMS["S1_DECAY"])
     else:
-        s["stopped"], s["peak_equity"], s["entry_date"] = False, capital, datetime.now(timezone.utc).isoformat()
-        s1_lev = -1.0
-    s2_lev = 1.0 if price > sma400 else 0.0
-    return max(-2.0, min(2.0, s1_lev + s2_lev))
+        if s1["stopped"]: s1["stopped"], s1["peak_equity"] = False, 0.0
+        s1["entry_date"] = datetime.now(timezone.utc).isoformat()
+        s1_lev = -1.0 
+
+    # S2 Logic
+    s2 = p_state["s2"]
+    s2_lev = 0.0
+    if price > sma400:
+        if not s2["stopped"]: s2_lev = 1.0
+        else:
+            if (price - sma400) / sma400 < PLANNER_PARAMS["S2_PROX"]:
+                s2["stopped"], s2["peak_equity"] = False, 0.0
+                s2_lev = 0.5 
+    else:
+        if s2["stopped"]: s2["stopped"] = False
+        s2_lev = 0.0
+
+    net_lev = max(-2.0, min(2.0, s1_lev + s2_lev))
+
+    # 4. Save State for Next Loop
+    p_state["last_price"] = price
+    p_state["last_lev"] = net_lev
+    p_state["debug_levs"] = [s1_lev, s2_lev]
+
+    return net_lev
 
 def run_tumbler(df_1d, state, capital):
     s = state["tumbler"]
@@ -168,20 +250,12 @@ def run_tumbler(df_1d, state, capital):
     
     if iii < TUMBLER_PARAMS["FLAT_THRESH"]: s["flat_regime"] = True
     
-    # Corrected Flat Regime Release: Check SMA1 OR SMA2
     if s["flat_regime"]:
         sma1 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA1"])
         sma2 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA2"])
         curr = df_1d['close'].iloc[-1]
-        
-        band1 = sma1 * TUMBLER_PARAMS["BAND"]
-        band2 = sma2 * TUMBLER_PARAMS["BAND"]
-        
-        # Release if price touches the band of SMA1 OR SMA2
-        on_sma1 = abs(curr - sma1) <= band1
-        on_sma2 = abs(curr - sma2) <= band2
-        
-        if on_sma1 or on_sma2:
+        band1, band2 = sma1 * TUMBLER_PARAMS["BAND"], sma2 * TUMBLER_PARAMS["BAND"]
+        if abs(curr - sma1) <= band1 or abs(curr - sma2) <= band2:
             s["flat_regime"] = False
             
     if s["flat_regime"]: return 0.0
@@ -191,57 +265,31 @@ def run_tumbler(df_1d, state, capital):
     return lev if (curr > sma1 and curr > sma2) else (-lev if (curr < sma1 and curr < sma2) else 0.0)
 
 def run_gainer(df_1h, df_1d):
-    """
-    Implements the exact logic from binance_analysis.py with 3-tuple parameter sets
-    and specific GA weights: MACD_1H (0.8), MACD_1D (0.4), SMA_1D (0.4).
-    """
     def calc_macd_pos(prices, config):
-        params = config['params']
-        weights = config['weights']
+        params, weights = config['params'], config['weights']
         composite = 0.0
-        # Iterate over the 3 parameter sets (e.g., 97/366/47, etc.)
         for (f, s, sig_p), w in zip(params, weights):
-            # Using adjust=False to match binance_analysis.py logic
             fast = prices.ewm(span=f, adjust=False).mean()
             slow = prices.ewm(span=s, adjust=False).mean()
             macd = fast - slow
             sig_line = macd.ewm(span=sig_p, adjust=False).mean()
-            val = 1.0 if macd.iloc[-1] > sig_line.iloc[-1] else -1.0
-            composite += val * w
-        
+            composite += (1.0 if macd.iloc[-1] > sig_line.iloc[-1] else -1.0) * w
         total_w = sum(weights)
         return composite / total_w if total_w > 0 else composite
 
     def calc_sma_pos(prices, config):
-        params = config['params']
-        weights = config['weights']
+        params, weights = config['params'], config['weights']
         composite = 0.0
-        current_price = prices.iloc[-1]
-        # Iterate over the 3 SMA windows
+        current = prices.iloc[-1]
         for p, w in zip(params, weights):
-            sma_val = get_sma(prices, p)
-            val = 1.0 if current_price > sma_val else -1.0
-            composite += val * w
-            
+            composite += (1.0 if current > get_sma(prices, p) else -1.0) * w
         total_w = sum(weights)
         return composite / total_w if total_w > 0 else composite
 
-    # 1. MACD 1H (GA Weight: 0.8)
-    macd_1h_raw = calc_macd_pos(df_1h['close'], GAINER_PARAMS["MACD_1H"])
-    s_macd_1h = macd_1h_raw * GAINER_PARAMS["GA_WEIGHTS"]["MACD_1H"]
-
-    # 2. MACD 1D (GA Weight: 0.4)
-    macd_1d_raw = calc_macd_pos(df_1d['close'], GAINER_PARAMS["MACD_1D"])
-    s_macd_1d = macd_1d_raw * GAINER_PARAMS["GA_WEIGHTS"]["MACD_1D"]
-
-    # 3. SMA 1D (GA Weight: 0.4)
-    sma_1d_raw = calc_sma_pos(df_1d['close'], GAINER_PARAMS["SMA_1D"])
-    s_sma_1d = sma_1d_raw * GAINER_PARAMS["GA_WEIGHTS"]["SMA_1D"]
-
-    # Normalize by sum of GA weights (0.8 + 0.4 + 0.4 = 1.6)
-    total_ga_weight = sum(GAINER_PARAMS["GA_WEIGHTS"].values())
-    
-    return (s_macd_1h + s_macd_1d + s_sma_1d) / total_ga_weight
+    m1h = calc_macd_pos(df_1h['close'], GAINER_PARAMS["MACD_1H"]) * GAINER_PARAMS["GA_WEIGHTS"]["MACD_1H"]
+    m1d = calc_macd_pos(df_1d['close'], GAINER_PARAMS["MACD_1D"]) * GAINER_PARAMS["GA_WEIGHTS"]["MACD_1D"]
+    s1d = calc_sma_pos(df_1d['close'], GAINER_PARAMS["SMA_1D"]) * GAINER_PARAMS["GA_WEIGHTS"]["SMA_1D"]
+    return (m1h + m1d + s1d) / sum(GAINER_PARAMS["GA_WEIGHTS"].values())
 
 # --- Execution ---
 def limit_chaser(api, target_qty):
@@ -257,7 +305,6 @@ def limit_chaser(api, target_qty):
             log.info(f"Chase Done | Delta: {delta:.5f}")
             break
         
-        # Sledgehammer Cleanup
         try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
         except: pass
         time.sleep(0.5)
@@ -277,46 +324,73 @@ def limit_chaser(api, target_qty):
                 resp = api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": size, "limitPrice": limit_px, "postOnly": True})
                 log.info(f"Chase {i+1} | {side.upper()} {size} @ {limit_px} | {resp.get('result')}")
             except: pass
-        
         time.sleep(CHASE_INTERVAL)
     
     try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
     except: pass
 
-def manage_stops(api, net_size, price):
+def manage_stops(api, net_size, price, state, strat_cap):
     if dry or abs(net_size) < MIN_TRADE_SIZE: return
-    
-    # "Side" here is the ORDER side to close the position.
-    # Long Pos (net > 0) -> Sell Stop / Sell Limit
-    # Short Pos (net < 0) -> Buy Stop / Buy Limit
     side = "sell" if net_size > 0 else "buy"
+    direction = 1 if net_size > 0 else -1
     
-    # Apply Tumbler/Planner logic to partial chunks (heuristic: 1/3 split)
-    qty_part = round(abs(net_size) * 0.333, 4)
-    if qty_part < MIN_TRADE_SIZE: return
+    # 1. Planner Stops (Virtual Equity Logic)
+    p_state = state["planner"]
+    s1_lev, s2_lev = p_state.get("debug_levs", [0.0, 0.0])
+    virt_eq = p_state["virtual_equity"]
+    
+    def place_stop(label, qty, stop_px):
+        qty = round(qty, 4)
+        if qty < MIN_TRADE_SIZE: return
+        # Safety: Don't flip position
+        # Note: If net_size=0.5 and planner=1.0, we rely on 'reduceOnly' to clip it.
+        stop_px_int = int(round(stop_px))
+        try:
+            api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty, "stopPrice": stop_px_int, "reduceOnly": True})
+        except Exception as e: log.error(f"[{label}] Stop Fail: {e}")
 
-    # 1. Planner Stop (13%)
-    p_stop = PLANNER_PARAMS["S1_STOP"]
-    px_p = int(price * (1 - p_stop)) if side == "sell" else int(price * (1 + p_stop))
-    try:
-        api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty_part, "stopPrice": px_p, "reduceOnly": True})
-    except: pass
+    # Planner S1 Stop (13%)
+    if abs(s1_lev) > 0.01 and not p_state["s1"]["stopped"]:
+        # SIZE = Planner's Contribution (Real Capital * Lev)
+        s1_qty = (strat_cap * abs(s1_lev)) / price 
+        
+        # PRICE = Trigger Level calculated from Virtual Equity Drawdown
+        s = p_state["s1"]
+        peak = s["peak_equity"]
+        current_dd_pct = (peak - virt_eq) / peak if peak > 0 else 0
+        room_pct = PLANNER_PARAMS["S1_STOP"] - current_dd_pct
+        
+        if room_pct > 0:
+            # We convert RemainingRoom% into PriceDistance% 
+            # (Higher leverage = tighter stop distance)
+            dist_pct = room_pct / abs(s1_lev)
+            stop_px = price * (1 - dist_pct * direction)
+            place_stop("PlanS1", s1_qty, stop_px)
 
-    # 2. Tumbler Stop (4.3%)
+    # Planner S2 Stop (27%)
+    if abs(s2_lev) > 0.01 and not p_state["s2"]["stopped"]:
+        s2_qty = (strat_cap * abs(s2_lev)) / price
+        s = p_state["s2"]
+        peak = s["peak_equity"]
+        current_dd_pct = (peak - virt_eq) / peak if peak > 0 else 0
+        room_pct = PLANNER_PARAMS["S2_STOP"] - current_dd_pct
+        
+        if room_pct > 0:
+            dist_pct = room_pct / abs(s2_lev)
+            stop_px = price * (1 - dist_pct * direction)
+            place_stop("PlanS2", s2_qty, stop_px)
+
+    # 2. Tumbler Stop (4.3% Price Distance - Fixed)
+    qty_tumb = round(abs(net_size) * 0.33, 4)
     t_stop = TUMBLER_PARAMS["STOP"]
     px_t = int(price * (1 - t_stop)) if side == "sell" else int(price * (1 + t_stop))
-    try:
-        api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty_part, "stopPrice": px_t, "reduceOnly": True})
-    except: pass
+    place_stop("TumbStop", qty_tumb, px_t)
 
-    # 3. Tumbler Take Profit (12.6%) - NEW
+    # 3. Tumbler Take Profit (12.6%)
     t_tp = TUMBLER_PARAMS["TAKE_PROFIT"]
-    # If Selling to close (Long): Price = Current * (1 + 0.126) -> Higher
-    # If Buying to close (Short): Price = Current * (1 - 0.126) -> Lower
     px_tp = int(price * (1 + t_tp)) if side == "sell" else int(price * (1 - t_tp))
     try:
-        r = api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": qty_part, "limitPrice": px_tp, "reduceOnly": True})
-        log.info(f"Tumbler TP Placed | Px: {px_tp} | {r.get('result')}")
+        api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": qty_tumb, "limitPrice": px_tp, "reduceOnly": True})
     except: pass
 
 def run_cycle(api):
@@ -336,11 +410,12 @@ def run_cycle(api):
         log.info(f"Cap: ${strat_cap:.0f} | Price: ${curr_price:.1f}")
     except: return
     
-    # Fair 2.0 Calculation
+    # Strategies
     r_p = run_planner(df_1d, state, strat_cap)
     r_t = run_tumbler(df_1d, state, strat_cap)
     r_g = run_gainer(df_1h, df_1d)
     
+    # Normalization (Fair 2.0)
     n_p, n_t, n_g = r_p, r_t * (TARGET_STRAT_LEV / TUMBLER_MAX_LEV), r_g * TARGET_STRAT_LEV
     log.info(f"Levs | P:{n_p:.2f} T:{n_t:.2f} G:{n_g:.2f}")
 
@@ -348,7 +423,7 @@ def run_cycle(api):
     limit_chaser(api, target_qty)
     
     final_pos = get_net_position(api)
-    manage_stops(api, final_pos, curr_price)
+    manage_stops(api, final_pos, curr_price, state, strat_cap)
     save_state(state)
     log.info("--- END ---")
 
