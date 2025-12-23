@@ -1,215 +1,446 @@
 #!/usr/bin/env python3
 """
-planner.py - Fixed Maturity Trend System
-Target: FF_XBTUSD_260327
+master_trader.py - Clean Trading Engine
+Features:
+- "Fair 2.0" Normalization (All strategies target 2.0x Max).
+- Position-Aware Limit Chaser (Cancel-All logic).
+- Minimalistic Logging with [HH:MM] timestamps.
+- Slow-Log Protection (0.1s pause) for Railway console.
+- Atomic State Management for strategy persistence.
+- Full Gainer Ensemble (MACD 1H/1D + SMA 1D) matching Analysis.
+- Tumbler Corrected: SMA1/SMA2 Release + 12.6% Take Profit.
+- Planner Final: Virtual Equity System for isolated drawdown tracking.
 """
+
 import json
 import logging
 import os
+import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict
-import kraken_ohlc
+import numpy as np
+import pandas as pd
 import kraken_futures as kf
+import kraken_ohlc
+
+# --- Global Configuration ---
+SYMBOL_FUTS = "PF_XBTUSD"
+SYMBOL_OHLC = "XBTUSD"
+CAP_SPLIT = 0.333
+LIMIT_CHASE_DURATION = 720
+CHASE_INTERVAL = 60
+MIN_TRADE_SIZE = 0.0002
+LIMIT_OFFSET_TICKS = 1
+
+# Normalization Constants
+TUMBLER_MAX_LEV = 4.327
+TARGET_STRAT_LEV = 2.0
+
+STATE_FILE = Path("master_state.json")
+
+# --- Custom Slow Logging Handler ---
+class SlowStreamHandler(logging.StreamHandler):
+    """Pauses for 0.1s after every log message to prevent console flooding."""
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.stream.write(msg + self.terminator)
+            self.flush()
+            time.sleep(0.1) 
+        except Exception:
+            self.handleError(record)
+
+# Setup Minimalist Logging
+log = logging.getLogger("MASTER")
+log.setLevel(logging.INFO)
+slow_h = SlowStreamHandler(sys.stdout)
+slow_h.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M"))
+log.addHandler(slow_h)
 
 dry = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 
-SYMBOL_FUTS_UC = "FF_XBTUSD_260327"
-SYMBOL_OHLC_KRAKEN = "XBTUSD" 
-INTERVAL_KRAKEN = 1440
+# --- Strategy Parameters ---
+PLANNER_PARAMS = {
+    "S1_SMA": 120, "S1_DECAY": 40, "S1_STOP": 0.13, 
+    "S2_SMA": 400, "S2_STOP": 0.27, "S2_PROX": 0.05
+}
 
-S1_SMA = 120
-S1_DECAY_DAYS = 40
-S1_STOP_PCT = 0.13  
-S2_SMA = 400
-S2_PROX_PCT = 0.05  
-S2_STOP_PCT = 0.27  
+TUMBLER_PARAMS = {
+    "SMA1": 32, "SMA2": 114, 
+    "STOP": 0.043, "TAKE_PROFIT": 0.126, 
+    "III_WIN": 27, "FLAT_THRESH": 0.356, "BAND": 0.077, 
+    "LEVS": [0.079, 4.327, 3.868], "III_TH": [0.058, 0.259]
+}
 
-STOP_WAIT_TIME = 300 # Reduced for hourly checks
-LIMIT_OFFSET_PCT = 0.0002 
-MIN_TRADE_SIZE = 0.0001  
+GAINER_PARAMS = {
+    "GA_WEIGHTS": {"MACD_1H": 0.8, "MACD_1D": 0.4, "SMA_1D": 0.4},
+    "MACD_1H": {
+        'params': [(97, 366, 47), (15, 40, 11), (16, 55, 13)], 
+        'weights': [0.45, 0.43, 0.01]
+    },
+    "MACD_1D": {
+        'params': [(52, 64, 61), (5, 6, 4), (17, 18, 16)], 
+        'weights': [0.87, 0.92, 0.73]
+    },
+    "SMA_1D": {
+        'params': [40, 120, 390], 
+        'weights': [0.6, 0.8, 0.4]
+    }
+}
 
-log = logging.getLogger("planner")
-STATE_FILE = Path("planner_state.json")
-
-def load_state() -> Dict:
+# --- State Management ---
+def load_state():
+    defaults = {
+        "planner": {
+            "virtual_equity": 0.0, # 0.0 triggers init to strat_cap
+            "last_price": 0.0,
+            "last_lev": 0.0,
+            "s1": {"entry_date": None, "peak_equity": 0.0, "stopped": False},
+            "s2": {"peak_equity": 0.0, "stopped": False},
+            "debug_levs": [0.0, 0.0] 
+        },
+        "tumbler": {"flat_regime": False}
+    }
     if STATE_FILE.exists():
         try:
-            with open(STATE_FILE, "r") as f: return json.load(f)
-        except: pass
-    return {"s1": {"entry_date": None, "peak_equity": 0.0, "stopped": False}, "s2": {"peak_equity": 0.0, "stopped": False}, "starting_capital": None, "trades": []}
+            with open(STATE_FILE, "r") as f:
+                saved = json.load(f)
+                # Deep merge defaults
+                for k, v in defaults.items():
+                    if k not in saved: saved[k] = v
+                    elif isinstance(v, dict):
+                        for sub_k, sub_v in v.items():
+                            if sub_k not in saved[k]: saved[k][sub_k] = sub_v
+                return saved
+        except Exception as e: log.error(f"State load error: {e}")
+    return defaults
 
-def save_state(state: Dict):
-    with open(STATE_FILE, "w") as f: json.dump(state, f, indent=2)
+def save_state(state):
+    try:
+        temp_file = STATE_FILE.with_suffix(".tmp")
+        with open(temp_file, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(temp_file, STATE_FILE)
+    except Exception as e: log.error(f"State save error: {e}")
 
+# --- Strategy Helpers ---
 def get_sma(prices, window):
     if len(prices) < window: return 0.0
     return prices.rolling(window=window).mean().iloc[-1]
 
-def calculate_decay_weight(entry_date_str):
+def get_market_price(api):
+    try:
+        resp = api.get_tickers()
+        for t in resp.get("tickers", []):
+            if t.get("symbol") == SYMBOL_FUTS: return float(t.get("markPrice"))
+    except: pass
+    return 0.0
+
+def get_net_position(api):
+    try:
+        resp = api.get_open_positions()
+        for p in resp.get("openPositions", []):
+            if p.get('symbol') == SYMBOL_FUTS:
+                size = float(p.get('size', 0.0))
+                return size if p.get('side') == 'long' else -size
+    except: pass
+    return 0.0
+
+def calculate_decay(entry_date_str, decay_days):
     if not entry_date_str: return 1.0
     entry_dt = datetime.fromisoformat(entry_date_str)
     if entry_dt.tzinfo is None: entry_dt = entry_dt.replace(tzinfo=timezone.utc)
     days_since = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 86400
-    if days_since >= S1_DECAY_DAYS: return 0.0
-    weight = 1.0 - (days_since / S1_DECAY_DAYS) ** 2
+    if days_since >= decay_days: return 0.0
+    weight = 1.0 - (days_since / decay_days) ** 2
     return max(0.0, weight)
 
-def update_trailing_stops(state, current_equity, s1_active, s2_active):
-    if state["starting_capital"] is None: state["starting_capital"] = current_equity
-    s1 = state["s1"]
-    if s1_active:
-        if current_equity > s1["peak_equity"]: s1["peak_equity"] = current_equity
-        dd = (s1["peak_equity"] - current_equity) / s1["peak_equity"] if s1["peak_equity"] > 0 else 0
-        if dd > S1_STOP_PCT:
-            s1["stopped"] = True; s1["entry_date"] = None
-    else:
-        if not s1["stopped"]: s1["peak_equity"] = current_equity
-    s2 = state["s2"]
-    if s2_active:
-        if current_equity > s2["peak_equity"]: s2["peak_equity"] = current_equity
-        dd = (s2["peak_equity"] - current_equity) / s2["peak_equity"] if s2["peak_equity"] > 0 else 0
-        if dd > S2_STOP_PCT:
-            s2["stopped"] = True
-    else:
-        if not s2["stopped"]: s2["peak_equity"] = current_equity
-    return state
+# --- Strategy Logic ---
 
-def get_strategy_signals(price, sma120, sma400, state):
+def run_planner(df_1d, state, capital):
+    """
+    Fully implemented Planner with Virtual Equity System.
+    Isolates Planner's PnL from Gainer/Tumbler to prevent cross-contamination of stops.
+    """
+    p_state = state["planner"]
+    price = df_1d['close'].iloc[-1]
+    
+    # Init Virtual Equity if fresh or migration
+    if p_state["virtual_equity"] <= 0.0 or p_state["last_price"] <= 0.0:
+        p_state["virtual_equity"] = capital
+        p_state["last_price"] = price
+        p_state["last_lev"] = 0.0
+        # Init peaks if missing
+        if p_state["s1"]["peak_equity"] == 0: p_state["s1"]["peak_equity"] = capital
+        if p_state["s2"]["peak_equity"] == 0: p_state["s2"]["peak_equity"] = capital
+
+    # 1. Update Virtual Equity (The "Isolation Layer")
+    # PnL = %PriceChange * Leverage
+    last_p = p_state["last_price"]
+    last_l = p_state["last_lev"]
+    
+    if last_p > 0:
+        pct_change = (price - last_p) / last_p
+        # If we were Long (lev > 0): Price Up -> Equity Up
+        # If we were Short (lev < 0): Price Up -> Equity Down
+        pnl_pct = pct_change * last_l 
+        p_state["virtual_equity"] *= (1.0 + pnl_pct)
+
+    virt_eq = p_state["virtual_equity"]
+    
+    # 2. Check Stops based on Virtual Equity
+    for key, stop_pct in [("s1", PLANNER_PARAMS["S1_STOP"]), ("s2", PLANNER_PARAMS["S2_STOP"])]:
+        s = p_state[key]
+        if virt_eq > s["peak_equity"]: s["peak_equity"] = virt_eq
+        
+        if s["peak_equity"] > 0:
+            dd = (s["peak_equity"] - virt_eq) / s["peak_equity"]
+            if dd > stop_pct:
+                s["stopped"] = True
+                if key == "s1": s["entry_date"] = None
+
+    # 3. Calculate Signals
+    sma120 = get_sma(df_1d['close'], PLANNER_PARAMS["S1_SMA"])
+    sma400 = get_sma(df_1d['close'], PLANNER_PARAMS["S2_SMA"])
+
+    # S1 Logic
+    s1 = p_state["s1"]
     s1_lev = 0.0
-    s1_state = state["s1"]
     if price > sma120:
-        if not s1_state["stopped"]:
-            if s1_state["entry_date"] is None: s1_state["entry_date"] = datetime.now(timezone.utc).isoformat()
-            s1_lev = 1.0 * calculate_decay_weight(s1_state["entry_date"])
+        if not s1["stopped"]:
+            if not s1["entry_date"]: s1["entry_date"] = datetime.now(timezone.utc).isoformat()
+            s1_lev = 1.0 * calculate_decay(s1["entry_date"], PLANNER_PARAMS["S1_DECAY"])
     else:
-        if s1_state["stopped"]: s1_state["stopped"] = False; s1_state["peak_equity"] = 0.0
-        s1_state["entry_date"] = datetime.now(timezone.utc).isoformat()
-        s1_lev = -1.0 * calculate_decay_weight(s1_state["entry_date"])
+        if s1["stopped"]: s1["stopped"], s1["peak_equity"] = False, 0.0
+        s1["entry_date"] = datetime.now(timezone.utc).isoformat()
+        s1_lev = -1.0 
 
+    # S2 Logic
+    s2 = p_state["s2"]
     s2_lev = 0.0
-    s2_state = state["s2"]
     if price > sma400:
-        if not s2_state["stopped"]: s2_lev = 1.0
+        if not s2["stopped"]: s2_lev = 1.0
         else:
-            if (price - sma400) / sma400 < S2_PROX_PCT:
-                s2_state["stopped"] = False; s2_state["peak_equity"] = 0.0; s2_lev = 0.5
+            if (price - sma400) / sma400 < PLANNER_PARAMS["S2_PROX"]:
+                s2["stopped"], s2["peak_equity"] = False, 0.0
+                s2_lev = 0.5 
     else:
-        if s2_state["stopped"]: s2_state["stopped"] = False
+        if s2["stopped"]: s2["stopped"] = False
         s2_lev = 0.0
 
-    net_leverage = max(-2.0, min(2.0, s1_lev + s2_lev))
-    return net_leverage, s1_lev, s2_lev, state
+    net_lev = max(-2.0, min(2.0, s1_lev + s2_lev))
 
-def get_current_net_position(api, symbol):
-    try:
-        resp = api.get_open_positions()
-        for p in resp.get("openPositions", []):
-            if p.get('symbol') == symbol:
-                size = float(p.get('size', 0.0))
-                return size if p.get('side') == 'long' else -size
-        return 0.0
-    except: return 0.0
+    # 4. Save State for Next Loop
+    p_state["last_price"] = price
+    p_state["last_lev"] = net_lev
+    p_state["debug_levs"] = [s1_lev, s2_lev]
 
-def get_market_price(api, symbol):
-    try:
-        resp = api.get_tickers()
-        for t in resp.get("tickers", []):
-            if t.get("symbol") == symbol: return float(t.get("markPrice"))
-        raise ValueError("Ticker not found")
-    except: return 0.0
+    return net_lev
 
-def execute_delta_order(api, symbol, delta_size, current_price):
-    abs_size = round(abs(delta_size), 4)
-    if abs_size < MIN_TRADE_SIZE: return "SKIPPED"
-
-    side = "buy" if delta_size > 0 else "sell"
-    limit_price = int(round(current_price * (1.0 - LIMIT_OFFSET_PCT) if side == "buy" else current_price * (1.0 + LIMIT_OFFSET_PCT)))
+def run_tumbler(df_1d, state, capital):
+    s = state["tumbler"]
+    w = TUMBLER_PARAMS["III_WIN"]
+    if len(df_1d) < w+1: return 0.0
+    log_ret = np.log(df_1d['close'] / df_1d['close'].shift(1))
+    iii = (log_ret.rolling(w).sum().abs() / log_ret.abs().rolling(w).sum()).fillna(0).iloc[-1]
+    lev = TUMBLER_PARAMS["LEVS"][2]
+    if iii < TUMBLER_PARAMS["III_TH"][0]: lev = TUMBLER_PARAMS["LEVS"][0]
+    elif iii < TUMBLER_PARAMS["III_TH"][1]: lev = TUMBLER_PARAMS["LEVS"][1]
     
-    if dry: return "FILLED"
+    if iii < TUMBLER_PARAMS["FLAT_THRESH"]: s["flat_regime"] = True
+    
+    if s["flat_regime"]:
+        sma1 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA1"])
+        sma2 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA2"])
+        curr = df_1d['close'].iloc[-1]
+        band1, band2 = sma1 * TUMBLER_PARAMS["BAND"], sma2 * TUMBLER_PARAMS["BAND"]
+        if abs(curr - sma1) <= band1 or abs(curr - sma2) <= band2:
+            s["flat_regime"] = False
+            
+    if s["flat_regime"]: return 0.0
+    
+    sma1, sma2 = get_sma(df_1d['close'], TUMBLER_PARAMS["SMA1"]), get_sma(df_1d['close'], TUMBLER_PARAMS["SMA2"])
+    curr = df_1d['close'].iloc[-1]
+    return lev if (curr > sma1 and curr > sma2) else (-lev if (curr < sma1 and curr < sma2) else 0.0)
 
-    try:
-        api.send_order({"orderType": "lmt", "symbol": symbol, "side": side, "size": abs_size, "limitPrice": limit_price})
-        time.sleep(STOP_WAIT_TIME)
-        api.cancel_all_orders({"symbol": symbol})
-        return "CHECK_AGAIN"
-    except Exception as e:
-        log.error(f"Limit failed: {e}"); return "ERROR"
+def run_gainer(df_1h, df_1d):
+    def calc_macd_pos(prices, config):
+        params, weights = config['params'], config['weights']
+        composite = 0.0
+        for (f, s, sig_p), w in zip(params, weights):
+            fast = prices.ewm(span=f, adjust=False).mean()
+            slow = prices.ewm(span=s, adjust=False).mean()
+            macd = fast - slow
+            sig_line = macd.ewm(span=sig_p, adjust=False).mean()
+            composite += (1.0 if macd.iloc[-1] > sig_line.iloc[-1] else -1.0) * w
+        total_w = sum(weights)
+        return composite / total_w if total_w > 0 else composite
 
-def manage_stop_loss_orders(api, symbol, current_price, allocated_collateral, net_size, s1_lev, s2_lev, state):
-    if dry or abs(net_size) < MIN_TRADE_SIZE: return
-    try: api.cancel_all_orders({"symbol": symbol})
+    def calc_sma_pos(prices, config):
+        params, weights = config['params'], config['weights']
+        composite = 0.0
+        current = prices.iloc[-1]
+        for p, w in zip(params, weights):
+            composite += (1.0 if current > get_sma(prices, p) else -1.0) * w
+        total_w = sum(weights)
+        return composite / total_w if total_w > 0 else composite
+
+    m1h = calc_macd_pos(df_1h['close'], GAINER_PARAMS["MACD_1H"]) * GAINER_PARAMS["GA_WEIGHTS"]["MACD_1H"]
+    m1d = calc_macd_pos(df_1d['close'], GAINER_PARAMS["MACD_1D"]) * GAINER_PARAMS["GA_WEIGHTS"]["MACD_1D"]
+    s1d = calc_sma_pos(df_1d['close'], GAINER_PARAMS["SMA_1D"]) * GAINER_PARAMS["GA_WEIGHTS"]["SMA_1D"]
+    return (m1h + m1d + s1d) / sum(GAINER_PARAMS["GA_WEIGHTS"].values())
+
+# --- Execution ---
+def limit_chaser(api, target_qty):
+    if dry: return
+    log.info(f"Chase Start | Tgt: {target_qty:.4f}")
+    try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
     except: pass
 
-    is_long = net_size > 0
-    side = "sell" if is_long else "buy"
-    direction = 1 if is_long else -1
+    for i in range(int(LIMIT_CHASE_DURATION / CHASE_INTERVAL)):
+        curr_pos = get_net_position(api)
+        delta = target_qty - curr_pos
+        if abs(delta) < MIN_TRADE_SIZE:
+            log.info(f"Chase Done | Delta: {delta:.5f}")
+            break
+        
+        try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+        except: pass
+        time.sleep(0.5)
+
+        side = "buy" if delta > 0 else "sell"
+        size = round(abs(delta), 4)
+        tk = api.get_tickers()
+        limit_px = 0
+        for t in tk.get("tickers", []):
+            if t["symbol"] == SYMBOL_FUTS:
+                limit_px = int(float(t["bid"])) if side == "buy" else int(float(t["ask"]))
+                limit_px += (-LIMIT_OFFSET_TICKS if side == "buy" else LIMIT_OFFSET_TICKS)
+                break
+        
+        if limit_px > 0:
+            try:
+                resp = api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": size, "limitPrice": limit_px, "postOnly": True})
+                log.info(f"Chase {i+1} | {side.upper()} {size} @ {limit_px} | {resp.get('result')}")
+            except: pass
+        time.sleep(CHASE_INTERVAL)
+    
+    try: api.cancel_all_orders({"symbol": SYMBOL_FUTS})
+    except: pass
+
+def manage_stops(api, net_size, price, state, strat_cap):
+    if dry or abs(net_size) < MIN_TRADE_SIZE: return
+    side = "sell" if net_size > 0 else "buy"
+    direction = 1 if net_size > 0 else -1
+    
+    # 1. Planner Stops (Virtual Equity Logic)
+    p_state = state["planner"]
+    s1_lev, s2_lev = p_state.get("debug_levs", [0.0, 0.0])
+    virt_eq = p_state["virtual_equity"]
     
     def place_stop(label, qty, stop_px):
         qty = round(qty, 4)
         if qty < MIN_TRADE_SIZE: return
+        # Safety: Don't flip position
+        # Note: If net_size=0.5 and planner=1.0, we rely on 'reduceOnly' to clip it.
         stop_px_int = int(round(stop_px))
         try:
-            api.send_order({"orderType": "stp", "symbol": symbol, "side": side, "size": qty, "stopPrice": stop_px_int, "reduceOnly": True})
-        except Exception as e: log.error(f"[{label}] Failed: {e}")
+            api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty, "stopPrice": stop_px_int, "reduceOnly": True})
+        except Exception as e: log.error(f"[{label}] Stop Fail: {e}")
 
-    if not state["s1"]["stopped"] and abs(s1_lev) > 0.01:
-        peak_s1 = state["s1"]["peak_equity"]
-        if peak_s1 == 0: peak_s1 = allocated_collateral
-        loss_allowance = peak_s1 * (1 - S1_STOP_PCT) - allocated_collateral
-        stop_price_s1 = current_price + (loss_allowance / abs(net_size)) * direction
-        place_stop("S1", (allocated_collateral * abs(s1_lev)) / current_price, stop_price_s1)
-
-    if not state["s2"]["stopped"] and abs(s2_lev) > 0.01:
-        peak_s2 = state["s2"]["peak_equity"]
-        if peak_s2 == 0: peak_s2 = allocated_collateral
-        loss_allowance = peak_s2 * (1 - S2_STOP_PCT) - allocated_collateral
-        stop_price_s2 = current_price + (loss_allowance / abs(net_size)) * direction
-        place_stop("S2", (allocated_collateral * abs(s2_lev)) / current_price, stop_price_s2)
-
-def daily_trade(api, capital_pct=1.0) -> str:
-    log.info("--- Planner ---")
-    df = kraken_ohlc.get_ohlc(SYMBOL_OHLC_KRAKEN, interval=INTERVAL_KRAKEN)
-    if df.empty: return "ERROR: No OHLC"
+    # Planner S1 Stop (13%)
+    if abs(s1_lev) > 0.01 and not p_state["s1"]["stopped"]:
+        # SIZE = Planner's Contribution (Real Capital * Lev)
+        s1_qty = (strat_cap * abs(s1_lev)) / price 
         
-    current_spot = df['close'].iloc[-1]
-    sma120 = get_sma(df['close'], S1_SMA)
-    sma400 = get_sma(df['close'], S2_SMA)
-    
+        # PRICE = Trigger Level calculated from Virtual Equity Drawdown
+        s = p_state["s1"]
+        peak = s["peak_equity"]
+        current_dd_pct = (peak - virt_eq) / peak if peak > 0 else 0
+        room_pct = PLANNER_PARAMS["S1_STOP"] - current_dd_pct
+        
+        if room_pct > 0:
+            # We convert RemainingRoom% into PriceDistance% 
+            # (Higher leverage = tighter stop distance)
+            dist_pct = room_pct / abs(s1_lev)
+            stop_px = price * (1 - dist_pct * direction)
+            place_stop("PlanS1", s1_qty, stop_px)
+
+    # Planner S2 Stop (27%)
+    if abs(s2_lev) > 0.01 and not p_state["s2"]["stopped"]:
+        s2_qty = (strat_cap * abs(s2_lev)) / price
+        s = p_state["s2"]
+        peak = s["peak_equity"]
+        current_dd_pct = (peak - virt_eq) / peak if peak > 0 else 0
+        room_pct = PLANNER_PARAMS["S2_STOP"] - current_dd_pct
+        
+        if room_pct > 0:
+            dist_pct = room_pct / abs(s2_lev)
+            stop_px = price * (1 - dist_pct * direction)
+            place_stop("PlanS2", s2_qty, stop_px)
+
+    # 2. Tumbler Stop (4.3% Price Distance - Fixed)
+    qty_tumb = round(abs(net_size) * 0.33, 4)
+    t_stop = TUMBLER_PARAMS["STOP"]
+    px_t = int(price * (1 - t_stop)) if side == "sell" else int(price * (1 + t_stop))
+    place_stop("TumbStop", qty_tumb, px_t)
+
+    # 3. Tumbler Take Profit (12.6%)
+    t_tp = TUMBLER_PARAMS["TAKE_PROFIT"]
+    px_tp = int(price * (1 + t_tp)) if side == "sell" else int(price * (1 - t_tp))
+    try:
+        api.send_order({"orderType": "lmt", "symbol": SYMBOL_FUTS, "side": side, "size": qty_tumb, "limitPrice": px_tp, "reduceOnly": True})
+    except: pass
+
+def run_cycle(api):
+    log.info("--- CYCLE ---")
+    try:
+        df_1h = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 60)
+        df_1d = kraken_ohlc.get_ohlc(SYMBOL_OHLC, 1440)
+    except Exception as e:
+        log.error(f"OHLC Fail: {e}")
+        return
+
     state = load_state()
+    curr_price = get_market_price(api) or df_1h['close'].iloc[-1]
     try:
         accts = api.get_accounts()
-        total_pv = float(accts["accounts"]["flex"]["portfolioValue"])
-        collateral = total_pv * capital_pct
-    except Exception as e: return f"ERROR: {e}"
+        strat_cap = float(accts["accounts"]["flex"]["portfolioValue"]) * CAP_SPLIT
+        log.info(f"Cap: ${strat_cap:.0f} | Price: ${curr_price:.1f}")
+    except: return
+    
+    # Strategies
+    r_p = run_planner(df_1d, state, strat_cap)
+    r_t = run_tumbler(df_1d, state, strat_cap)
+    r_g = run_gainer(df_1h, df_1d)
+    
+    # Normalization (Fair 2.0)
+    n_p, n_t, n_g = r_p, r_t * (TARGET_STRAT_LEV / TUMBLER_MAX_LEV), r_g * TARGET_STRAT_LEV
+    log.info(f"Levs | P:{n_p:.2f} T:{n_t:.2f} G:{n_g:.2f}")
 
-    state = update_trailing_stops(state, collateral, True, True)
-    target_leverage, s1_lev, s2_lev, state = get_strategy_signals(current_spot, sma120, sma400, state)
+    target_qty = (n_p + n_t + n_g) * strat_cap / curr_price
+    limit_chaser(api, target_qty)
     
-    futs_price = get_market_price(api, SYMBOL_FUTS_UC)
-    if futs_price == 0: futs_price = current_spot
-    
-    target_qty = (collateral * target_leverage) / futs_price
-    current_qty = get_current_net_position(api, SYMBOL_FUTS_UC)
-    delta_qty = target_qty - current_qty
-    
-    res = execute_delta_order(api, SYMBOL_FUTS_UC, delta_qty, futs_price)
-    
-    if res == "CHECK_AGAIN" and not dry:
-        rem_delta = round(target_qty - get_current_net_position(api, SYMBOL_FUTS_UC), 4)
-        if abs(rem_delta) >= MIN_TRADE_SIZE:
-            log.info(f"Fallback MKT: {rem_delta}")
-            try: 
-                api.send_order({"orderType": "mkt", "symbol": SYMBOL_FUTS_UC, "side": "buy" if rem_delta > 0 else "sell", "size": abs(rem_delta)})
-                time.sleep(10)
-            except: pass
-    
-    final_net_size = get_current_net_position(api, SYMBOL_FUTS_UC)
-    manage_stop_loss_orders(api, SYMBOL_FUTS_UC, futs_price, collateral, final_net_size, s1_lev, s2_lev, state)
-
-    state["trades"].append({"date": datetime.now().isoformat(), "price": futs_price, "leverage": target_leverage})
+    final_pos = get_net_position(api)
+    manage_stops(api, final_pos, curr_price, state, strat_cap)
     save_state(state)
+    log.info("--- END ---")
+
+def main():
+    api_key, api_sec = os.getenv("KRAKEN_API_KEY"), os.getenv("KRAKEN_API_SECRET")
+    if not api_key: sys.exit("No API Keys")
+    api = kf.KrakenFuturesApi(api_key, api_sec)
     
-    if abs(delta_qty) < MIN_TRADE_SIZE: return f"ALREADY POS ({current_qty:.4f})"
-    return f"EXEC Lev: {target_leverage}"
+    if os.getenv("RUN_TRADE_NOW", "false").lower() in {"1", "true", "yes"}:
+        run_cycle(api)
+        
+    while True:
+        now = datetime.now(timezone.utc)
+        wait = ((now + timedelta(hours=1)).replace(minute=1, second=0, microsecond=0) - now).total_seconds()
+        log.info(f"Sleep {wait/60:.0f}m")
+        time.sleep(wait)
+        run_cycle(api)
+
+if __name__ == "__main__":
+    main()
