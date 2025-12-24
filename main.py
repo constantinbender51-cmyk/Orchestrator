@@ -9,7 +9,7 @@ Features:
 - Atomic State Management for strategy persistence.
 - Full Gainer Ensemble (MACD 1H/1D + SMA 1D) matching Analysis.
 - Tumbler Corrected: SMA1/SMA2 Release + 12.6% Take Profit.
-- Planner Final: Virtual Equity System for isolated drawdown tracking.
+- Planner Final: Independent Virtual Equity & Symmetric Logic.
 """
 
 import json
@@ -93,11 +93,13 @@ GAINER_PARAMS = {
 def load_state():
     defaults = {
         "planner": {
-            "virtual_equity": 0.0, # 0.0 triggers init to strat_cap
+            "s1_equity": 0.0, # 0.0 triggers init to strat_cap
+            "s2_equity": 0.0,
             "last_price": 0.0,
-            "last_lev": 0.0,
-            "s1": {"entry_date": None, "peak_equity": 0.0, "stopped": False},
-            "s2": {"peak_equity": 0.0, "stopped": False},
+            "last_lev_s1": 0.0,
+            "last_lev_s2": 0.0,
+            "s1": {"entry_date": None, "peak_equity": 0.0, "stopped": False, "trend": 0},
+            "s2": {"peak_equity": 0.0, "stopped": False, "trend": 0},
             "debug_levs": [0.0, 0.0] 
         },
         "tumbler": {"flat_regime": False}
@@ -160,82 +162,106 @@ def calculate_decay(entry_date_str, decay_days):
 
 def run_planner(df_1d, state, capital):
     """
-    Fully implemented Planner with Virtual Equity System.
-    Isolates Planner's PnL from Gainer/Tumbler to prevent cross-contamination of stops.
+    Corrected Planner Logic:
+    1. Independent Virtual Equity for S1 and S2.
+    2. Symmetric Short/Long Logic.
+    3. Correct Proximity Sizing for S2.
     """
     p_state = state["planner"]
     price = df_1d['close'].iloc[-1]
     
-    # Init Virtual Equity if fresh or migration
-    if p_state["virtual_equity"] <= 0.0 or p_state["last_price"] <= 0.0:
-        p_state["virtual_equity"] = capital
-        p_state["last_price"] = price
-        p_state["last_lev"] = 0.0
-        # Init peaks if missing
-        if p_state["s1"]["peak_equity"] == 0: p_state["s1"]["peak_equity"] = capital
-        if p_state["s2"]["peak_equity"] == 0: p_state["s2"]["peak_equity"] = capital
+    # --- 1. State Initialization (Independent Buckets) ---
+    if p_state["s1_equity"] <= 0.0: p_state["s1_equity"] = capital
+    if p_state["s2_equity"] <= 0.0: p_state["s2_equity"] = capital
+    if p_state["last_price"] <= 0.0: p_state["last_price"] = price
 
-    # 1. Update Virtual Equity (The "Isolation Layer")
-    # PnL = %PriceChange * Leverage
+    # --- 2. Update Virtual Equities Independently ---
     last_p = p_state["last_price"]
-    last_l = p_state["last_lev"]
-    
     if last_p > 0:
         pct_change = (price - last_p) / last_p
-        # If we were Long (lev > 0): Price Up -> Equity Up
-        # If we were Short (lev < 0): Price Up -> Equity Down
-        pnl_pct = pct_change * last_l 
-        p_state["virtual_equity"] *= (1.0 + pnl_pct)
-
-    virt_eq = p_state["virtual_equity"]
-    
-    # 2. Check Stops based on Virtual Equity
-    for key, stop_pct in [("s1", PLANNER_PARAMS["S1_STOP"]), ("s2", PLANNER_PARAMS["S2_STOP"])]:
-        s = p_state[key]
-        if virt_eq > s["peak_equity"]: s["peak_equity"] = virt_eq
         
-        if s["peak_equity"] > 0:
-            dd = (s["peak_equity"] - virt_eq) / s["peak_equity"]
-            if dd > stop_pct:
-                s["stopped"] = True
-                if key == "s1": s["entry_date"] = None
+        # Update S1 Equity
+        s1_pnl = pct_change * p_state["last_lev_s1"]
+        p_state["s1_equity"] *= (1.0 + s1_pnl)
+        
+        # Update S2 Equity
+        s2_pnl = pct_change * p_state["last_lev_s2"]
+        p_state["s2_equity"] *= (1.0 + s2_pnl)
 
-    # 3. Calculate Signals
+    # --- 3. Strategy 1: Tactical Trend (Symmetric) ---
     sma120 = get_sma(df_1d['close'], PLANNER_PARAMS["S1_SMA"])
-    sma400 = get_sma(df_1d['close'], PLANNER_PARAMS["S2_SMA"])
-
-    # S1 Logic
+    s1_trend = 1 if price > sma120 else -1
     s1 = p_state["s1"]
-    s1_lev = 0.0
-    if price > sma120:
-        if not s1["stopped"]:
-            if not s1["entry_date"]: s1["entry_date"] = datetime.now(timezone.utc).isoformat()
-            s1_lev = 1.0 * calculate_decay(s1["entry_date"], PLANNER_PARAMS["S1_DECAY"])
-    else:
-        if s1["stopped"]: s1["stopped"], s1["peak_equity"] = False, 0.0
+    
+    # Trend Change / Reset Logic
+    if s1.get("trend", 0) != s1_trend:
+        s1["trend"] = s1_trend
         s1["entry_date"] = datetime.now(timezone.utc).isoformat()
-        s1_lev = -1.0 
+        s1["stopped"] = False
+        s1["peak_equity"] = p_state["s1_equity"] # Reset Peak
+    
+    # Trailing Stop Check
+    if p_state["s1_equity"] > s1["peak_equity"]:
+        s1["peak_equity"] = p_state["s1_equity"]
+    
+    dd_s1 = 0.0
+    if s1["peak_equity"] > 0:
+        dd_s1 = (s1["peak_equity"] - p_state["s1_equity"]) / s1["peak_equity"]
+    
+    if dd_s1 > PLANNER_PARAMS["S1_STOP"]:
+        s1["stopped"] = True
 
-    # S2 Logic
+    # Sizing Calculation
+    s1_lev = 0.0
+    if not s1["stopped"]:
+        decay_w = calculate_decay(s1["entry_date"], PLANNER_PARAMS["S1_DECAY"])
+        s1_lev = float(s1_trend) * decay_w
+    
+    # --- 4. Strategy 2: Core Trend (Symmetric + Prox) ---
+    sma400 = get_sma(df_1d['close'], PLANNER_PARAMS["S2_SMA"])
+    s2_trend = 1 if price > sma400 else -1
     s2 = p_state["s2"]
+    
+    # Trend Change Logic
+    if s2.get("trend", 0) != s2_trend:
+        s2["trend"] = s2_trend
+        s2["stopped"] = False
+        s2["peak_equity"] = p_state["s2_equity"]
+
+    # Trailing Stop Check
+    if p_state["s2_equity"] > s2["peak_equity"]:
+        s2["peak_equity"] = p_state["s2_equity"]
+        
+    dd_s2 = 0.0
+    if s2["peak_equity"] > 0:
+        dd_s2 = (s2["peak_equity"] - p_state["s2_equity"]) / s2["peak_equity"]
+        
+    if dd_s2 > PLANNER_PARAMS["S2_STOP"]:
+        s2["stopped"] = True
+
+    # Proximity Check (Active & Re-entry)
+    dist_pct = abs(price - sma400) / sma400
+    is_prox = dist_pct < PLANNER_PARAMS["S2_PROX"]
+    tgt_size = 0.5 if is_prox else 1.0
+
     s2_lev = 0.0
-    if price > sma400:
-        if not s2["stopped"]: s2_lev = 1.0
-        else:
-            if (price - sma400) / sma400 < PLANNER_PARAMS["S2_PROX"]:
-                s2["stopped"], s2["peak_equity"] = False, 0.0
-                s2_lev = 0.5 
+    if s2["stopped"]:
+        # Re-entry allowed if Proximity is True
+        if is_prox:
+            s2["stopped"] = False 
+            s2["peak_equity"] = p_state["s2_equity"] 
+            s2_lev = float(s2_trend) * tgt_size
     else:
-        if s2["stopped"]: s2["stopped"] = False
-        s2_lev = 0.0
+        s2_lev = float(s2_trend) * tgt_size
 
+    # --- 5. Final State Update ---
     net_lev = max(-2.0, min(2.0, s1_lev + s2_lev))
-
-    # 4. Save State for Next Loop
+    
     p_state["last_price"] = price
-    p_state["last_lev"] = net_lev
+    p_state["last_lev_s1"] = s1_lev
+    p_state["last_lev_s2"] = s2_lev
     p_state["debug_levs"] = [s1_lev, s2_lev]
-
+    
     return net_lev
 
 def run_tumbler(df_1d, state, capital):
@@ -334,16 +360,13 @@ def manage_stops(api, net_size, price, state, strat_cap):
     side = "sell" if net_size > 0 else "buy"
     direction = 1 if net_size > 0 else -1
     
-    # 1. Planner Stops (Virtual Equity Logic)
+    # 1. Planner Stops (Independent Virtual Equity Logic)
     p_state = state["planner"]
     s1_lev, s2_lev = p_state.get("debug_levs", [0.0, 0.0])
-    virt_eq = p_state["virtual_equity"]
     
     def place_stop(label, qty, stop_px):
         qty = round(qty, 4)
         if qty < MIN_TRADE_SIZE: return
-        # Safety: Don't flip position
-        # Note: If net_size=0.5 and planner=1.0, we rely on 'reduceOnly' to clip it.
         stop_px_int = int(round(stop_px))
         try:
             api.send_order({"orderType": "stp", "symbol": SYMBOL_FUTS, "side": side, "size": qty, "stopPrice": stop_px_int, "reduceOnly": True})
@@ -351,18 +374,18 @@ def manage_stops(api, net_size, price, state, strat_cap):
 
     # Planner S1 Stop (13%)
     if abs(s1_lev) > 0.01 and not p_state["s1"]["stopped"]:
-        # SIZE = Planner's Contribution (Real Capital * Lev)
+        # SIZE = Planner's Contribution
         s1_qty = (strat_cap * abs(s1_lev)) / price 
         
-        # PRICE = Trigger Level calculated from Virtual Equity Drawdown
+        # STOP PRICE Calculation based on S1 Specific Drawdown
         s = p_state["s1"]
         peak = s["peak_equity"]
-        current_dd_pct = (peak - virt_eq) / peak if peak > 0 else 0
+        curr_eq = p_state["s1_equity"]
+        current_dd_pct = (peak - curr_eq) / peak if peak > 0 else 0
         room_pct = PLANNER_PARAMS["S1_STOP"] - current_dd_pct
         
         if room_pct > 0:
-            # We convert RemainingRoom% into PriceDistance% 
-            # (Higher leverage = tighter stop distance)
+            # Adjust distance by leverage: Tighter stop for higher leverage
             dist_pct = room_pct / abs(s1_lev)
             stop_px = price * (1 - dist_pct * direction)
             place_stop("PlanS1", s1_qty, stop_px)
@@ -372,7 +395,8 @@ def manage_stops(api, net_size, price, state, strat_cap):
         s2_qty = (strat_cap * abs(s2_lev)) / price
         s = p_state["s2"]
         peak = s["peak_equity"]
-        current_dd_pct = (peak - virt_eq) / peak if peak > 0 else 0
+        curr_eq = p_state["s2_equity"]
+        current_dd_pct = (peak - curr_eq) / peak if peak > 0 else 0
         room_pct = PLANNER_PARAMS["S2_STOP"] - current_dd_pct
         
         if room_pct > 0:
