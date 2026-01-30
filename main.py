@@ -430,7 +430,7 @@ def run_cycle(api):
     curr_price = get_market_price(api) or df_1h['close'].iloc[-1]
     try:
         accts = api.get_accounts()
-        strat_cap = float(accts["accounts"]["flex"]["portfolioValue"]) * CAP_SPLIT
+        strat_cap = float(accts["accounts"]["flex"]["portfolioValue"]*2) * CAP_SPLIT
         log.info(f"Cap: ${strat_cap:.0f} | Price: ${curr_price:.1f}")
     except: return
     
