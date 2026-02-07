@@ -32,6 +32,7 @@ LIMIT_CHASE_DURATION = 720
 CHASE_INTERVAL = 60
 MIN_TRADE_SIZE = 0.0002
 LIMIT_OFFSET_TICKS = 1
+GLOBAL_LEVERAGE=10
 
 # Normalization Constants
 TUMBLER_MAX_LEV = 4.327
@@ -430,7 +431,7 @@ def run_cycle(api):
     curr_price = get_market_price(api) or df_1h['close'].iloc[-1]
     try:
         accts = api.get_accounts()
-        strat_cap = float(accts["accounts"]["flex"]["portfolioValue"]*2) * CAP_SPLIT
+        strat_cap = float(accts["accounts"]["flex"]["portfolioValue"]*GLOBAL_LEVERAGE) * CAP_SPLIT
         log.info(f"Cap: ${strat_cap:.0f} | Price: ${curr_price:.1f}")
     except: return
     
